@@ -501,6 +501,20 @@ class CandlestickPatternDetector:
                 
                 # Regular Doji: indecision
                 else:
+                    atr_doji = self._calculate_atr(df, i)
+                    doji_price = float(candle['close'])
+                    # FIX: target was incorrectly set to price_at_detection (= 0 move).
+                    # Use ATR-based symmetric target: upside target for slight upward
+                    # context, downside for downward; distance = 1× ATR.
+                    if trend_up:
+                        doji_target = round(doji_price - atr_doji, 2)   # potential reversal down
+                        doji_sl     = float(candle['high']) + atr_doji * 0.3
+                    elif trend_down:
+                        doji_target = round(doji_price + atr_doji, 2)   # potential reversal up
+                        doji_sl     = float(candle['low'])  - atr_doji * 0.3
+                    else:
+                        doji_target = round(doji_price + atr_doji, 2)   # neutral — show upside
+                        doji_sl     = float(candle['low'])
                     patterns.append(PatternDetection(
                         pattern=CandlePattern.DOJI,
                         timestamp=candle['timestamp'],
@@ -512,9 +526,9 @@ class CandlestickPatternDetector:
                         strength=2,
                         success_rate=0.50,
                         description="Doji: Market indecision. Wait for confirmation from next candle.",
-                        price_at_detection=candle['close'],
-                        stop_loss=candle['low'] if candle['close'] > candle['open'] else candle['high'],
-                        target=candle['close']
+                        price_at_detection=doji_price,
+                        stop_loss=round(doji_sl, 2),
+                        target=doji_target
                     ))
         
         return patterns
@@ -3063,7 +3077,8 @@ class ORBSignal:
     target1:         float          # T1 = 1x ORB range extension
     target2:         float          # T2 = 2x ORB range extension
     target3:         float          # T3 = 3x ORB range extension
-    risk_reward:     float          # R:R to T2
+    target4:         float          # T4 = 4x ORB range extension (runner)
+    risk_reward:     float          # R:R to T2 (from entry_mid)
     volume_ratio:    float          # Breakout bar volume / 20-bar avg volume
     gap_pct:         float          # Gap % from previous close to today open
     gap_type:        str            # "GAP_UP" | "GAP_DOWN" | "FLAT"
@@ -3086,6 +3101,7 @@ class ORBSignal:
             "target1":        round(self.target1, 2),
             "target2":        round(self.target2, 2),
             "target3":        round(self.target3, 2),
+            "target4":        round(self.target4, 2),
             "risk_reward":    round(self.risk_reward, 2),
             "volume_ratio":   round(self.volume_ratio, 2),
             "gap_pct":        round(self.gap_pct, 3),
@@ -3285,6 +3301,7 @@ class ORBEngine:
             t1         = entry_high + orb_rng          # 1× ORB
             t2         = entry_high + orb_rng * 2      # 2× ORB
             t3         = entry_high + orb_rng * 3      # 3× ORB (runner)
+            t4         = entry_high + orb_rng * 4      # 4× ORB (full runner)
         else:
             entry_high = orb_low
             entry_low  = orb_low - orb_rng * 0.25
@@ -3293,8 +3310,14 @@ class ORBEngine:
             t1         = entry_low - orb_rng
             t2         = entry_low - orb_rng * 2
             t3         = entry_low - orb_rng * 3
+            t4         = entry_low - orb_rng * 4       # 4× ORB (full runner)
 
-        rr = round((t2 - entry_high) / risk if breakout_dir == "BULL" else (entry_low - t2) / risk, 2)
+        # FIX: RR must use entry_mid (displayed value), not the edge of the zone
+        entry_mid = (entry_low + entry_high) / 2
+        if breakout_dir == "BULL":
+            rr = round((t2 - entry_mid) / max(risk, 0.01), 2)
+        else:
+            rr = round((entry_mid - t2) / max(risk, 0.01), 2)
 
         return ORBSignal(
             symbol=symbol, timeframe=timeframe, direction=breakout_dir,
@@ -3303,7 +3326,7 @@ class ORBEngine:
             breakout_bar=breakout_bar_idx, breakout_time=bo_time,
             entry_zone=(round(entry_low, 2), round(entry_high, 2)),
             sl=round(sl, 2),
-            target1=round(t1, 2), target2=round(t2, 2), target3=round(t3, 2),
+            target1=round(t1, 2), target2=round(t2, 2), target3=round(t3, 2), target4=round(t4, 2),
             risk_reward=abs(rr),
             volume_ratio=bo_volume_ratio,
             gap_pct=gap_pct, gap_type=gap_type,
@@ -5679,6 +5702,7 @@ async def get_institutional_levels(symbol: str):
     return levels.to_dict()
 
 
+@app.get("/api/fno/{symbol}")
 async def get_fno_signals(symbol: str, interval: str = "5minute"):
     """Generate F&O signals using REAL Kite expiry dates, option chain, IV & Greeks."""
     if not kite_manager.is_authenticated:
@@ -6028,11 +6052,33 @@ async def get_orb(symbol: str, interval: str = "5minute"):
             "generated_at": datetime.now().isoformat(),
         }
 
+    # ── Invalidation check: if CMP has breached ORB High (BEAR) or Low (BULL),
+    # the signal is structurally dead — flag it so the UI shows a warning. ────
+    try:
+        curr_price = float(df["close"].iloc[-1])
+    except Exception:
+        curr_price = 0.0
+
+    signal_dict = signal.to_dict()
+    invalidated = False
+    if signal.direction == "BEAR" and curr_price > signal.orb_high:
+        invalidated = True
+        signal_dict["notes"] = [
+            f"⛔ Signal INVALIDATED — CMP ({curr_price:.2f}) reclaimed ORB High ({signal.orb_high:.2f}). Do not trade."
+        ] + signal_dict.get("notes", [])
+    elif signal.direction == "BULL" and curr_price < signal.orb_low:
+        invalidated = True
+        signal_dict["notes"] = [
+            f"⛔ Signal INVALIDATED — CMP ({curr_price:.2f}) broke below ORB Low ({signal.orb_low:.2f}). Do not trade."
+        ] + signal_dict.get("notes", [])
+
+    signal_dict["invalidated"] = invalidated
+
     return {
         "symbol":   symbol,
         "interval": interval,
-        "signal":   signal.to_dict(),
-        "status":   "BREAKOUT",
+        "signal":   signal_dict,
+        "status":   "INVALIDATED" if invalidated else "BREAKOUT",
         "generated_at": datetime.now().isoformat(),
     }
 
@@ -7203,12 +7249,25 @@ function loading(id) {
   document.getElementById(id).innerHTML = '<div style="text-align:center;padding:18px"><div class="spinner"></div><div style="margin-top:7px;font-size:.73rem;color:var(--muted)">Fetching live data...</div></div>';
 }
 
-function renderTargets(t1, t2, t3, t4, entry, sl, rr2, rr3, dir) {
+function renderTargets(t1, t2, t3, t4, entry, sl, rr2, rr3, dir, labelMode) {
+  // FIX: When signal is WAIT (rr2===0 or all targets equal entry), don't show
+  // a misleading target grid — show a waiting message instead.
+  if (!rr2 || rr2 === 0 || Math.abs(t1 - entry) < 0.01) {
+    return `<div style="padding:8px;font-size:.73rem;color:var(--muted);background:var(--panel2);border-radius:5px;margin-top:7px">
+      ⏳ No active setup — waiting for entry conditions to align.
+    </div>`;
+  }
+  // ORB uses range multiples, not Fib extensions — show correct labels
+  const isOrb = labelMode === 'orb';
+  const l1 = isOrb ? 'T1  1× ORB Range'           : 'T1 Fib 1.0 (Equal leg)';
+  const l2 = isOrb ? `T2  2× ORB | RR ${rr2 || '--'}x` : `T2 Fib 1.272 | RR ${rr2 || '--'}x`;
+  const l3 = isOrb ? `T3  3× ORB | RR ${rr3 || '--'}x` : `T3 Fib 1.618 Golden | RR ${rr3 || '--'}x`;
+  const l4 = isOrb ? 'T4  4× ORB Runner'           : 'T4 Fib 2.0 Runner';
   return `<div class="targets-grid">
-    <div class="tgt"><div class="tgt-label">T1 Fib 1.0 (Equal leg)</div><div class="tgt-val yellow">Rs.${fmtN(t1)}</div><div style="font-size:.62rem;color:var(--muted)">First exit 30-40%</div></div>
-    <div class="tgt"><div class="tgt-label">T2 Fib 1.272 | RR ${rr2 || '--'}x</div><div class="tgt-val green">Rs.${fmtN(t2)}</div><div style="font-size:.62rem;color:var(--muted)">Main target 40%</div></div>
-    <div class="tgt"><div class="tgt-label">T3 Fib 1.618 Golden | RR ${rr3 || '--'}x</div><div class="tgt-val accent">Rs.${fmtN(t3)}</div><div style="font-size:.62rem;color:var(--muted)">Extended 20%</div></div>
-    <div class="tgt"><div class="tgt-label">T4 Fib 2.0 Runner</div><div class="tgt-val purple">Rs.${fmtN(t4)}</div><div style="font-size:.62rem;color:var(--muted)">Runner 10% trail SL</div></div>
+    <div class="tgt"><div class="tgt-label">${l1}</div><div class="tgt-val yellow">Rs.${fmtN(t1)}</div><div style="font-size:.62rem;color:var(--muted)">First exit 30-40%</div></div>
+    <div class="tgt"><div class="tgt-label">${l2}</div><div class="tgt-val green">Rs.${fmtN(t2)}</div><div style="font-size:.62rem;color:var(--muted)">Main target 40%</div></div>
+    <div class="tgt"><div class="tgt-label">${l3}</div><div class="tgt-val accent">Rs.${fmtN(t3)}</div><div style="font-size:.62rem;color:var(--muted)">Extended 20%</div></div>
+    <div class="tgt"><div class="tgt-label">${l4}</div><div class="tgt-val purple">Rs.${fmtN(t4)}</div><div style="font-size:.62rem;color:var(--muted)">Runner 10% trail SL</div></div>
   </div>
   <div style="display:flex;gap:10px;margin-top:7px;font-size:.71rem;flex-wrap:wrap">
     <span>Entry: <b>Rs.${fmtN(entry)}</b></span>
@@ -7441,13 +7500,21 @@ async function loadOrb() {
     if (r.error) { document.getElementById('orbBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signal) { document.getElementById('orbBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">[WAIT] No ORB Signal</div><div class="muted" style="font-size:.73rem;margin-top:3px">' + (r.message||'Waiting for 9:30+ breakout.') + '</div></div>'; return; }
     const s = r.signal, dc = s.direction==='BULL'?'green':'red';
+    // FIX: show invalidation banner when CMP has breached the ORB signal level
+    const invalidBanner = s.invalidated
+      ? '<div style="background:#3a1010;border:1px solid var(--red);border-radius:5px;padding:7px;margin:7px 0;font-size:.73rem;color:var(--red)">'
+        + '⛔ <b>Signal Invalidated</b> — price has reclaimed the ORB boundary. Do not enter.'
+        + '</div>'
+      : '';
     document.getElementById('orbBody').innerHTML = '<div class="signal-box ' + (s.direction==='BULL'?'BUY':'SELL') + '">'
       + '<div class="sig-dir ' + dc + '">' + sigEmoji(s.direction==='BULL'?'BUY':'SELL') + ' ORB ' + s.direction + ' at ' + s.breakout_time + '</div>'
       + '<div style="font-size:.71rem;color:var(--muted);margin:3px 0">Vol: ' + s.volume_ratio.toFixed(1) + 'x avg | Conf: ' + s.confidence.toFixed(0) + '%</div>'
+      + invalidBanner
       + '<div style="background:var(--panel2);border-radius:5px;padding:7px;margin:7px 0;font-size:.72rem">'
       + 'ORB H: <b>Rs.' + fmtN(s.orb_high) + '</b>  ORB L: <b>Rs.' + fmtN(s.orb_low) + '</b>  Range: <b class="yellow">Rs.' + fmtN(s.orb_range) + '</b><br/>'
       + 'Entry Zone: <b>Rs.' + fmtN(s.entry_zone[0]) + ' - Rs.' + fmtN(s.entry_zone[1]) + '</b>  SL: <b class="red">Rs.' + fmtN(s.sl) + '</b></div>'
-      + renderTargets(s.target1, s.target2, s.target3, s.target3, (s.entry_zone[0]+s.entry_zone[1])/2, s.sl, s.risk_reward, null, s.direction==='BULL'?'BUY':'SELL')
+      // FIX: pass s.target4 (not s.target3 twice), use 'orb' label mode for correct ×ORB labels
+      + renderTargets(s.target1, s.target2, s.target3, s.target4, (s.entry_zone[0]+s.entry_zone[1])/2, s.sl, s.risk_reward, null, s.direction==='BULL'?'BUY':'SELL', 'orb')
       + (s.notes||[]).map(n => '<div class="note-item" style="margin-top:3px">' + n + '</div>').join('')
       + '</div>';
   } catch(e) { document.getElementById('orbBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }

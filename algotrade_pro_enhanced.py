@@ -7029,6 +7029,12 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
 const SYMBOLS = ["NIFTY 50", "NIFTY BANK", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE", "HINDUNILVR", "MARUTI", "TATAMOTORS", "AXISBANK", "LT", "WIPRO", "SUNPHARMA", "TATASTEEL", "KOTAKBANK", "SBIN", "ADANIENT", "BHARTIARTL", "NTPC", "POWERGRID", "ONGC", "COALINDIA", "HCLTECH", "TECHM", "VEDL", "JSWSTEEL", "HINDALCO", "ULTRACEMCO", "GRASIM", "TITAN", "NESTLEIND", "DIVISLAB", "NATIONALUM", "SAIL", "NMDC", "MOIL", "APLAPOLLO", "LTM", "PERSISTENT", "COFORGE", "MPHASIS", "KPITTECH", "HAPPSTMNDS", "RATEGAIN", "MASTEK", "FIVESTAR", "MUTHOOTFIN", "CHOLAFIN", "ABCAPITAL", "MANAPPURAM", "IIFL", "POONAWALLA", "DMART", "TRENT", "NYKAA", "KALYANKJIL", "TVSHLTD", "BAJAJ-AUTO", "HEROMOTOCO", "MOTHERSON", "TIINDIA", "BALKRISIND", "RVNL", "IREDA", "IRFC", "RECLTD", "PFC", "PHOENIXLTD", "GODREJPROP", "OBEROIRLTY", "ALKEM", "TORNTPHARM", "MAXHEALTH", "APOLLOHOSP", "DRREDDY", "CIPLA", "INDUSTOWER", "HFCL"];
 let currentSym = 'RELIANCE', currentTab = 'smc';
 
+// Event delegation for scan result cards (avoids onclick escaping issues)
+document.addEventListener('click', function(e) {
+  const card = e.target.closest('[data-sym]');
+  if (card) { selectSym(card.getAttribute('data-sym')); }
+});
+
 document.querySelectorAll('.tab').forEach(t => {
   t.addEventListener('click', () => {
     document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
@@ -7264,7 +7270,7 @@ async function runScan() {
       return;
     }
     document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">Found ' + r.total_found + ' from ' + r.scanned + ' symbols. Showing top ' + r.signals.length + '.</div>'
-      + r.signals.map(s => '<div class="scan-item ' + s.direction + '" onclick="selectSym(\'' + s.symbol + '\')">'
+      + r.signals.map(s => '<div class="scan-item ' + s.direction + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
         + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
         + '<span class="chip ' + (s.direction==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.direction + '</span>'
         + '<span class="quality-' + (s.quality==='A+'?'Ap':s.quality) + '" style="font-size:.78rem;margin-left:3px">' + s.quality + '</span></div>'
@@ -7291,7 +7297,7 @@ async function runSmcScan() {
     if (r.error) { document.getElementById('scanBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signals || !r.signals.length) { document.getElementById('scanBody').innerHTML = '<div class="muted" style="font-size:.78rem;padding:8px">No SMC signals found.</div>'; return; }
     document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">SMC: ' + r.total_found + ' from ' + r.scanned + ' scanned</div>'
-      + r.signals.map(s => '<div class="scan-item ' + s.signal + '" onclick="selectSym(\'' + s.symbol + '\')">'
+      + r.signals.map(s => '<div class="scan-item ' + s.signal + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
         + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
         + '<span class="chip ' + (s.signal==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.signal + '</span></div>'
         + '<span class="' + (s.signal==='BUY'?'green':'red') + '" style="font-size:.7rem">' + s.confidence.toFixed(0) + '%</span></div>'
@@ -7380,6 +7386,19 @@ setTimeout(() => selectSym('RELIANCE'), 600);
 </script>
 </body></html>"""
 
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    """Return minimal SVG favicon — prevents 404 log spam."""
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+        '<rect width="32" height="32" rx="6" fill="#060b14"/>'
+        '<text x="16" y="22" font-size="18" text-anchor="middle" fill="#00d4ff">A</text>'
+        '</svg>'
+    )
+    from fastapi.responses import Response
+    return Response(content=svg, media_type="image/svg+xml")
 
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)

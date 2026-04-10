@@ -15,7 +15,7 @@
 """
 
 import os, sys, json, math, time, asyncio, logging, sqlite3, platform
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import Dict, List, Optional, Any, Tuple, Set
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -1619,7 +1619,8 @@ class ICTEngine:
     ]
 
     def _in_killzone(self) -> Tuple[bool, str]:
-        now = datetime.now()
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=IST)
         h, m = now.hour, now.minute
         for (sh, sm), (eh, em), name, _ in self.KILLZONES:
             if (h, m) >= (sh, sm) and (h, m) < (eh, em):
@@ -1638,7 +1639,8 @@ class ICTEngine:
         yesterday's distant swing from setting wildly off Fib targets intraday.
         Falls back to the full 80-bar window when today's session has < 10 bars.
         """
-        now = datetime.now()
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=IST).replace(tzinfo=None)
         session_start = now.replace(hour=10, minute=0, second=0, microsecond=0)
         use_session_only = now >= session_start
 
@@ -3236,13 +3238,13 @@ class ORBEngine:
         # ── Gap analysis ─────────────────────────────────────────────────
         yesterday_mask = df["timestamp"].apply(lambda x: ts_date(x) < today)
         yesterday_df   = df[yesterday_mask]
+        today_open = float(orb_bars["open"].iloc[0])  # always use real open
         if not yesterday_df.empty:
             prev_close = float(yesterday_df["close"].iloc[-1])
-            today_open = float(orb_bars["open"].iloc[0])
             gap_pct    = (today_open - prev_close) / prev_close * 100
         else:
+            # Fallback: try to compute from orb_bars open vs first bar close estimate
             gap_pct   = 0.0
-            today_open = orb_high
 
         if gap_pct > 0.2:
             gap_type = "GAP_UP"
@@ -3389,7 +3391,7 @@ class ORBEngine:
 # Stores the first confirmed ORBSignal per (symbol, date) so that subsequent
 # API calls within the same session always return the original signal rather
 # than a potentially shifted re-computation (avoids intraday signal flipping).
-_orb_cache: Dict[str, Any] = {}   # key: "SYMBOL:YYYY-MM-DD"  value: ORBSignal
+# _orb_cache is declared below as a TTLCache(ttl=28800) — do not redeclare here
 
 
 orb_engine = ORBEngine()
@@ -5093,13 +5095,50 @@ class TTLCache:
             self._store.clear()
             self._ts.clear()
 
+    # ── dict-compatibility methods so len(), `in`, and [] assignment work ──
+    def __len__(self) -> int:
+        with self._lock:
+            # Count only non-expired entries
+            now = time.time()
+            return sum(1 for k, ts in self._ts.items() if now - ts < self.ttl)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.set(key, value)
+
+    def __getitem__(self, key: str) -> Any:
+        v = self.get(key)
+        if v is None:
+            raise KeyError(key)
+        return v
+
+    def __contains__(self, key: object) -> bool:
+        return self.get(str(key)) is not None
+
+    def keys(self):
+        with self._lock:
+            now = time.time()
+            return [k for k, ts in self._ts.items() if now - ts < self.ttl]
+
 # One cache per analysis type. 3-minute TTL matches the shortest candle interval.
 _smc_cache       = TTLCache(ttl=180)
 _ict_cache       = TTLCache(ttl=180)
 _structure_cache = TTLCache(ttl=180)
-_orb_cache       = TTLCache(ttl=60)   # ORB changes more often (1-min TTL)
+_orb_cache       = TTLCache(ttl=28800)  # Full trading day TTL (8 h) — ORB signals are daily
 _pattern_cache   = TTLCache(ttl=180)
 _scan_cache      = TTLCache(ttl=240)  # Full scan results cached 4 min
+
+def normalise_conf(v: float) -> float:
+    """Ensure confidence is always in 0–100 range.
+    Accepts both 0.0–1.0 (fractional) and 0–100 (percent) formats and
+    returns a consistent 0–100 float so display code never needs to
+    conditionally multiply by 100.
+    """
+    if v is None:
+        return 0.0
+    if 0.0 <= v <= 1.0:
+        return round(v * 100, 1)
+    return round(float(v), 1)
+
 
 # ── Kite API semaphore — max 3 concurrent historical data requests ─────────────
 # Kite rate limit: 3 req/s per IP. This prevents HTTP 429 errors during scans.
@@ -5613,6 +5652,12 @@ async def scan_all(limit: int = 20, interval: str = "5minute", min_conf: float =
     if not kite_manager.is_authenticated:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _scan_all_sync, limit, interval, min_conf)
+
+
+def _scan_all_sync(limit: int = 20, interval: str = "5minute", min_conf: float = 0.65):
+
     results = []
     scan_list = SCAN_UNIVERSE.copy()
 
@@ -5766,14 +5811,21 @@ async def get_ict_analysis(symbol: str, interval: str = "15minute"):
         return JSONResponse({"error": f"No token for {symbol}"}, status_code=404)
 
     days_back = 10 if "minute" in interval else 60
-    df = kite_manager.get_historical_data(token, interval, days_back)
+    _ict_key = f"ict:{symbol}:{interval}"
+    _cached_ict = _ict_cache.get(_ict_key)
+    if _cached_ict is not None:
+        return _cached_ict
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 30:
         return JSONResponse({"error": "Not enough data"}, status_code=404)
 
     # Daily data for HTF bias
     df_daily = None
     try:
-        df_daily = kite_manager.get_historical_data(token, "day", 30)
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 30)
     except Exception:
         pass
 
@@ -5782,12 +5834,14 @@ async def get_ict_analysis(symbol: str, interval: str = "15minute"):
 
     result = ict_engine.analyse(df, symbol, interval, df_daily, inst_levels)
 
-    return {
+    resp = {
         "symbol":    symbol,
         "interval":  interval,
         "ict":       result.to_dict(),
         "inst_levels": inst_levels.to_dict(),
     }
+    _ict_cache.set(_ict_key, resp)
+    return resp
 
 
 # ── Institutional Levels endpoint ─────────────────────────────────────────────
@@ -6042,13 +6096,20 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
         return JSONResponse({"error": f"No token for {symbol}"}, status_code=404)
 
     days_back = 10 if "minute" in interval else 60
-    df = kite_manager.get_historical_data(token, interval, days_back)
+    _smc_key = f"smc:{symbol}:{interval}"
+    _cached_smc = _smc_cache.get(_smc_key)
+    if _cached_smc is not None:
+        return _cached_smc
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 20:
         return JSONResponse({"error": "No data"}, status_code=404)
 
     df_1h = None
     try:
-        df_1h = kite_manager.get_historical_data(token, "60minute", 5)
+        with _kite_semaphore:
+            df_1h = kite_manager.get_historical_data(token, "60minute", 5)
     except Exception:
         pass
 
@@ -6058,12 +6119,13 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
     # Also run ICT for additional context
     df_daily = None
     try:
-        df_daily = kite_manager.get_historical_data(token, "day", 20)
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 20)
     except Exception:
         pass
     ict = ict_engine.analyse(df, symbol, interval, df_daily, inst_levels)
 
-    return {
+    smc_resp = {
         "symbol":        symbol,
         "interval":      interval,
         "smc":           result.to_dict(),
@@ -6089,6 +6151,8 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
             "daily_bias": ict.daily_bias,
         },
     }
+    _smc_cache.set(_smc_key, smc_resp)
+    return smc_resp
 
 @app.get("/api/orb/{symbol}")
 async def get_orb(symbol: str, interval: str = "5minute"):
@@ -6680,6 +6744,23 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
     # Sort by confidence
     results.sort(key=lambda x: x["confidence"], reverse=True)
 
+    # Auto-log signals to journal
+    for _r in results[:limit]:
+        try:
+            _ez = _r.get("entry_zone", [0, 0])
+            threading.Thread(
+                target=_log_signal,
+                args=(_r["symbol"], _r["direction"], "smc",
+                      _r["confidence"],
+                      _ez[0] if _ez else 0, _ez[1] if _ez else 0,
+                      _r.get("stop_loss", 0), _r.get("target_2", 0), _r.get("rr_t2", 0),
+                      _r.get("pattern_type", "")),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    _IST = timezone(timedelta(hours=5, minutes=30))
     return {
         "signals":      results[:limit],
         "total_found":  len(results),
@@ -6687,6 +6768,7 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
         "interval":     interval,
         "min_conf":     min_conf,
         "generated_at": datetime.now().isoformat(),
+        "scanned_at":   datetime.now(tz=_IST).strftime("%H:%M:%S IST"),
     }
 
 
@@ -6870,7 +6952,8 @@ async def institutional_scan(
             # ── ACCURACY IMPROVEMENT 3: Minimum RR gate ──────────────────────
             # Never surface a setup with RR < 1.5 to T2 (risk not worth reward).
             # Also flag if we are outside market hours (stale data warning).
-            _now = datetime.now()
+            _IST = timezone(timedelta(hours=5, minutes=30))
+            _now = datetime.now(tz=_IST).replace(tzinfo=None)
             _market_open  = _now.replace(hour=9, minute=30, second=0, microsecond=0)
             _market_close = _now.replace(hour=15, minute=30, second=0, microsecond=0)
             _in_market_hours = _market_open <= _now <= _market_close
@@ -6962,11 +7045,17 @@ async def institutional_scan(
             _stale_warning = [] if _in_market_hours else ["⚠️ Outside market hours — confirm before trading"]
             key_notes.extend(_stale_warning)
 
+            # Position sizing: 2% risk model
+            _entry_mid   = round((entry_low + entry_high) / 2, 2)
+            _risk_ps     = abs(_entry_mid - sl) if sl else 0
+            _pos_size    = int(CAPITAL * 0.02 / _risk_ps) if _risk_ps > 0 else 0
+
             results.append({
                 "symbol":        symbol,
                 "direction":     direction,
                 "quality":       quality,
                 "confidence":    composite_conf,
+                "position_size": _pos_size,
                 "engine_votes":  f"{votes}/3 engines agree",
                 "engines":       {
                     "smc":  norm(smc_sig),
@@ -7008,12 +7097,29 @@ async def institutional_scan(
 
     results.sort(key=lambda x: (x["confidence"], x["quality"] == "A+"), reverse=True)
 
+    # ── Auto-log all signals to journal (background, non-blocking) ────────
+    for _r in results:
+        try:
+            threading.Thread(
+                target=_log_signal,
+                args=(_r["symbol"], _r["direction"], "institutional",
+                      _r["confidence"],
+                      _r["entry_zone"][0], _r["entry_zone"][1],
+                      _r["stop_loss"], _r["target_2"], _r["rr_t2"],
+                      "; ".join(_r.get("notes", []))),
+                daemon=True,
+            ).start()
+        except Exception:
+            pass
+
+    _IST_tz = timezone(timedelta(hours=5, minutes=30))
     scan_response = {
         "signals":      results[:limit],
         "total_found":  len(results),
         "scanned":      len(symbol_data),
         "interval":     interval,
         "generated_at": datetime.now().isoformat(),
+        "scanned_at":   datetime.now(tz=_IST_tz).strftime("%H:%M:%S IST"),
         "cached":       False,
         "methodology":  (
             "Requires 2/3 engines (SMC + ICT + Structure) to agree. "
@@ -7232,6 +7338,20 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
 .tabs::-webkit-scrollbar{height:3px} .tabs::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
 .content::-webkit-scrollbar,.sym-list::-webkit-scrollbar{width:4px}
 .content::-webkit-scrollbar-thumb,.sym-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+/* Fix #10: Mobile responsive layout */
+@media (max-width:768px){
+  .main{flex-direction:column}
+  .sidebar{width:100%;height:auto;border-right:none;border-bottom:1px solid var(--border);flex-direction:column}
+  .sym-list{display:flex;flex-direction:row;flex-wrap:nowrap;overflow-x:auto;flex:none;padding:4px 6px;gap:4px}
+  .sym-list::-webkit-scrollbar{height:3px}
+  .sym-item{white-space:nowrap;padding:4px 9px}
+  .content{padding:8px}
+  .row{flex-direction:column}
+  .col{min-width:unset}
+  header{padding:6px 10px}
+  header h1{font-size:.88rem}
+  .tab{padding:8px 10px;font-size:.7rem}
+}
 </style>
 </head>
 <body>
@@ -7654,8 +7774,15 @@ async function runScan() {
       document.getElementById('scanBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">No setups found</div><div class="muted" style="font-size:.73rem;margin-top:3px">Scanned ' + r.scanned + ' symbols. No multi-engine confluence. Try lower confidence or different interval.</div></div>';
       return;
     }
-    document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">Found ' + r.total_found + ' from ' + r.scanned + ' symbols. Showing top ' + r.signals.length + '.</div>'
-      + r.signals.map(s => '<div class="scan-item ' + s.direction + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
+    // Notify on first/new top signal
+    if (r.signals[0] && typeof _notifySignal === 'function') {
+      _notifySignal(r.signals[0].symbol, r.signals[0].direction, r.signals[0].quality);
+    }
+    document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">Found ' + r.total_found + ' from ' + r.scanned + ' symbols. Showing top ' + r.signals.length + '.'
+      + (r.scanned_at ? ' <span style="color:var(--accent)">Scanned at ' + r.scanned_at + '</span>' : '') + '</div>'
+      + r.signals.map(s => {
+        const posSize = s.position_size && s.position_size > 0 ? '<span>📦 Qty: <b class="yellow">' + s.position_size + ' shares</b></span>' : '';
+        return '<div class="scan-item ' + s.direction + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
         + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
         + '<span class="chip ' + (s.direction==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.direction + '</span>'
         + '<span class="quality-' + (s.quality==='A+'?'Ap':s.quality) + '" style="font-size:.78rem;margin-left:3px">' + s.quality + '</span></div>'
@@ -7667,10 +7794,13 @@ async function runScan() {
         + '<span class="scan-t"><span class="muted">T3:</span> <b class="accent">Rs.' + fmtN(s.target_3) + '</b></span>'
         + '<span class="scan-t"><span class="muted">T4:</span> <b class="purple">Rs.' + fmtN(s.target_4) + '</b></span>'
         + '<span class="scan-t">RR T2: <b class="' + (s.rr_t2>=2?'green':'yellow') + '">' + s.rr_t2 + 'x</b></span>'
-        + '</div><div style="font-size:.66rem;color:var(--muted);margin-top:3px">'
+        + '</div>'
+        + (posSize ? '<div style="font-size:.67rem;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">' + posSize + '</div>' : '')
+        + '<div style="font-size:.66rem;color:var(--muted);margin-top:3px">'
         + (s.in_killzone ? '<span class="yellow">Killzone: ' + s.killzone + ' </span>' : '')
         + 'Daily: ' + s.daily_bias + ' | PDH:' + fmtN(s.pdh) + ' PDL:' + fmtN(s.pdl)
-        + '</div></div>').join('');
+        + '</div></div>';
+      }).join('');
   } catch(e) { document.getElementById('scanBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
@@ -7768,13 +7898,30 @@ async function loadFno() {
   try {
     const r = await fetch('/api/fno/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json());
     if (r.error) { document.getElementById('fnoBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+
+    // Fix #8: PCR panel at top of F&O tab
+    const biasColor = r.market_bias === 'BULLISH' ? 'green' : r.market_bias === 'BEARISH' ? 'red' : 'yellow';
+    const pcrPanel = r.market_bias ? (
+      '<div class="card" style="margin-bottom:8px;padding:8px 10px">'
+      + '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:.75rem">'
+      + '<span>🧭 Bias: <b class="' + biasColor + '">' + r.market_bias + '</b></span>'
+      + (r.range_support ? '<span>🟢 Support: <b>' + fmtN(r.range_support) + '</b></span>' : '')
+      + (r.range_resistance ? '<span>🔴 Resistance: <b>' + fmtN(r.range_resistance) + '</b></span>' : '')
+      + (r.range_pts ? '<span>↔️ Range: <b>' + fmtN(r.range_pts) + ' pts</b></span>' : '')
+      + (r.iv_proxy ? '<span>📊 IV Proxy: <b>' + r.iv_proxy + '%</b></span>' : '')
+      + '</div>'
+      + '<div style="font-size:.68rem;color:var(--muted);margin-top:4px">' + (r.bias_reason || '') + '</div>'
+      + '</div>'
+    ) : '';
+
     const sigs = r.signals || [];
-    if (!sigs.length) { document.getElementById('fnoBody').innerHTML = '<div class="muted" style="font-size:.78rem;padding:7px">No F&O signals. Use NIFTY, BANKNIFTY, or F&O-eligible stocks.</div>'; return; }
-    document.getElementById('fnoBody').innerHTML = sigs.map(s => {
+    if (!sigs.length) {
+      document.getElementById('fnoBody').innerHTML = pcrPanel + '<div class="muted" style="font-size:.78rem;padding:7px">No F&O signals. Use NIFTY, BANKNIFTY, or F&O-eligible stocks.</div>';
+      return;
+    }
+    document.getElementById('fnoBody').innerHTML = pcrPanel + sigs.map(s => {
       if (s.error) return '<div class="red" style="font-size:.78rem;padding:7px">' + s.error + '</div>';
       const dc = s.direction && s.direction.includes('CALL') ? 'green' : 'red';
-      // FIX #8: show capital required = option_price × lot_size so traders
-      // can immediately see margin needed before acting on the signal.
       const capitalNeeded = (s.option_price && s.lot_size)
         ? 'Rs.' + fmtN(s.option_price * s.lot_size)
         : '--';
@@ -7869,9 +8016,141 @@ function exportJournal() {
 }
 
 setTimeout(() => { selectSym('RELIANCE'); _startAutoRefresh(); }, 600);
+
+// ── Fix #9: Keyboard shortcuts ────────────────────────────────────────────────
+(function _initKeyboardShortcuts() {
+  const TAB_KEYS = {
+    '1': 'smc', '2': 'ict', '3': 'structure', '4': 'scan',
+    '5': 'orb', '6': 'patterns', '7': 'fno', '8': 'journal'
+  };
+  document.addEventListener('keydown', function(e) {
+    // Ignore when typing in an input
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (TAB_KEYS[e.key]) {
+      e.preventDefault();
+      const tab = document.querySelector('.tab[data-tab="' + TAB_KEYS[e.key] + '"]');
+      if (tab) tab.click();
+    }
+    // Enter = run active scan / load
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      const activeTab = document.querySelector('.tab.active');
+      if (!activeTab) return;
+      const t = activeTab.getAttribute('data-tab');
+      if (t === 'scan') { if (typeof runScan === 'function') runScan(); }
+      else { if (typeof loadAll === 'function') loadAll(); }
+    }
+    // ArrowLeft / ArrowRight = navigate symbol list
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+      e.preventDefault();
+      const items = document.querySelectorAll('.sym-item');
+      const active = document.querySelector('.sym-item.active');
+      if (!items.length) return;
+      const idx = Array.from(items).indexOf(active);
+      const next = e.key === 'ArrowRight' ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0);
+      if (items[next]) items[next].click();
+    }
+  });
+})();
+
+// ── Fix #12: Browser notifications when new signal fires ─────────────────────
+let _lastNotifKey = '';
+(function _initNotifications() {
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+  }
+})();
+
+function _notifySignal(symbol, direction, quality) {
+  const key = symbol + ':' + direction;
+  if (key === _lastNotifKey) return;
+  _lastNotifKey = key;
+  // Play a short beep via AudioContext
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain); gain.connect(ctx.destination);
+    osc.frequency.value = direction === 'BUY' ? 880 : 440;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.start(); osc.stop(ctx.currentTime + 0.4);
+  } catch(e) {}
+  // Browser notification
+  if ('Notification' in window && Notification.permission === 'granted') {
+    try {
+      new Notification('AlgoTrade: ' + direction + ' ' + symbol, {
+        body: 'Quality: ' + quality + ' — click to view',
+        icon: '/favicon.ico',
+      });
+    } catch(e) {}
+  }
+}
 </script>
 </body></html>"""
 
+
+
+def _log_signal(
+    symbol: str,
+    direction: str,
+    engine: str,
+    confidence: float,
+    entry_low: float,
+    entry_high: float,
+    sl: float,
+    t2: float,
+    rr_t2: float,
+    notes: str = "",
+) -> None:
+    """
+    Persist a BUY/SELL signal to the SQLite journal (signal_log table).
+    Called whenever a non-WAIT signal fires from any engine.
+    Thread-safe — uses its own sqlite3 connection.
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        ts = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        # Position sizing: 2% risk per trade
+        entry_mid = round((entry_low + entry_high) / 2, 2)
+        risk_per_share = abs(entry_mid - sl) if sl else 0
+        position_size = int(CAPITAL * 0.02 / risk_per_share) if risk_per_share > 0 else 0
+
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,
+                engine      TEXT,
+                confidence  REAL,
+                entry_low   REAL,
+                entry_high  REAL,
+                sl          REAL,
+                t1          REAL,
+                t2          REAL,
+                t3          REAL,
+                rr_t2       REAL,
+                position_size INTEGER,
+                outcome     TEXT    DEFAULT 'OPEN',
+                pnl         REAL    DEFAULT 0,
+                notes       TEXT
+            )
+        """)
+        conn.execute(
+            """INSERT INTO signal_log
+               (ts, symbol, direction, engine, confidence,
+                entry_low, entry_high, sl, t2, rr_t2, position_size, notes)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ts, symbol, direction, engine, round(confidence, 1),
+             entry_low, entry_high, sl, t2, round(rr_t2, 2), position_size, notes),
+        )
+        conn.commit()
+        conn.close()
+        log.info(f"📓 Logged {direction} signal for {symbol} ({engine}, conf={confidence:.0f}%)")
+    except Exception as exc:
+        log.warning(f"_log_signal error for {symbol}: {exc}")
 
 
 @app.get("/api/journal")

@@ -1,0 +1,47 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ─── SECRETS — NEVER COMMIT THESE ────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+_kite_token
+*.token
+secrets.json
+
+# ─── Runtime / ephemeral ─────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# ─── Local instrument cache (these are large; load fresh from Kite on deploy) ─
+_nfo_instruments.json
+_nse_instruments.json
+
+# ─── OS / IDE ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ─── Windows batch files (not needed on Railway Linux) ───────────────────────
+*.bat
+START_ENHANCED.bat
+
+# ─── Distribution ─────────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/

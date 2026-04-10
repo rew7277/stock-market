@@ -7482,7 +7482,8 @@ header h1 span{color:var(--accent)}
   </div>
 </header>
 <div class="tabs" id="tabs">
-  <div class="tab active" data-tab="smc">SMC Analysis</div>
+  <div class="tab active" data-tab="signal">Signal</div>
+  <div class="tab" data-tab="smc">SMC Analysis</div>
   <div class="tab" data-tab="ict">ICT / OTE</div>
   <div class="tab" data-tab="structure">Structure Setup</div>
   <div class="tab" data-tab="scanner">Inst. Scanner</div>
@@ -7501,7 +7502,42 @@ header h1 span{color:var(--accent)}
     <div class="sym-list" id="symList"></div>
   </div>
   <div class="content" id="content">
-    <div class="tab-content active" id="tab-smc">
+    <!-- ══ SIGNAL TAB ══════════════════════════════════════════════════════ -->
+    <div class="tab-content active" id="tab-signal">
+      <!-- Single symbol signal card -->
+      <div class="card" style="padding:16px">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Live Signal — <span id="sigSym" style="color:var(--accent)">--</span></span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="sigAge" style="font-size:.66rem;color:var(--muted)"></span>
+            <button class="btn primary" onclick="loadSignal()" style="padding:4px 12px;font-size:.72rem">Analyse</button>
+          </div>
+        </div>
+        <div id="sigBody">
+          <p class="muted" style="font-size:.78rem">Select a symbol from the sidebar, then click Analyse.</p>
+        </div>
+      </div>
+      <!-- Quick scanner -->
+      <div class="card" style="padding:16px">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Live Scanner — All Signals</span>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span id="scanAge2" style="font-size:.66rem;color:var(--muted)"></span>
+            <select id="scanInterval2" class="btn" style="padding:4px 9px;font-size:.7rem">
+              <option value="15minute">15 Min</option>
+              <option value="5minute">5 Min</option>
+              <option value="60minute">1 Hour</option>
+            </select>
+            <button class="btn primary" onclick="runQuickScan()" style="padding:4px 12px;font-size:.72rem">Scan All</button>
+          </div>
+        </div>
+        <div id="quickScanBody">
+          <p class="muted" style="font-size:.78rem">Click "Scan All" to find live BUY/SELL signals across 30+ stocks. Only A+ and A quality shown.</p>
+        </div>
+      </div>
+    </div>
+    <!-- ══ SMC TAB ════════════════════════════════════════════════════════ -->
+    <div class="tab-content" id="tab-smc">
       <div class="card"><div class="card-title">SMC Analysis -- <span id="smcSym">--</span></div><div id="smcBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-ict">
@@ -7579,7 +7615,7 @@ header h1 span{color:var(--accent)}
 </div>
 <script>
 const SYMBOLS = ["NIFTY 50", "NIFTY BANK", "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE", "HINDUNILVR", "MARUTI", "TATAMOTORS", "AXISBANK", "LT", "WIPRO", "SUNPHARMA", "TATASTEEL", "KOTAKBANK", "SBIN", "ADANIENT", "BHARTIARTL", "NTPC", "POWERGRID", "ONGC", "COALINDIA", "HCLTECH", "TECHM", "VEDL", "JSWSTEEL", "HINDALCO", "ULTRACEMCO", "GRASIM", "TITAN", "NESTLEIND", "DIVISLAB", "NATIONALUM", "SAIL", "NMDC", "MOIL", "APLAPOLLO", "LTM", "PERSISTENT", "COFORGE", "MPHASIS", "KPITTECH", "HAPPSTMNDS", "RATEGAIN", "MASTEK", "FIVESTAR", "MUTHOOTFIN", "CHOLAFIN", "ABCAPITAL", "MANAPPURAM", "IIFL", "POONAWALLA", "DMART", "TRENT", "NYKAA", "KALYANKJIL", "TVSHLTD", "BAJAJ-AUTO", "HEROMOTOCO", "MOTHERSON", "TIINDIA", "BALKRISIND", "RVNL", "IREDA", "IRFC", "RECLTD", "PFC", "PHOENIXLTD", "GODREJPROP", "OBEROIRLTY", "ALKEM", "TORNTPHARM", "MAXHEALTH", "APOLLOHOSP", "DRREDDY", "CIPLA", "INDUSTOWER", "HFCL"];
-let currentSym = 'RELIANCE', currentTab = 'smc';
+let currentSym = 'RELIANCE', currentTab = 'signal';
 
 // Event delegation for scan result cards (avoids onclick escaping issues)
 document.addEventListener('click', function(e) {
@@ -7609,10 +7645,8 @@ function selectSym(s) {
   currentSym = s;
   document.getElementById('symInput').value = s;
   document.querySelectorAll('.sym-item').forEach(el => el.classList.toggle('active', el.textContent === s));
-  // FIX: clear the active panel instantly so stale data from the previous
-  // symbol is never readable while the new request is in-flight.
   const panelMap = {
-    smc: 'smcBody', ict: 'ictBody', structure: 'structureBody',
+    signal: 'sigBody', smc: 'smcBody', ict: 'ictBody', structure: 'structureBody',
     orb: 'orbBody', patterns: 'patBody', fno: 'fnoBody', journal: 'journalBody',
   };
   const panelId = panelMap[currentTab];
@@ -7624,7 +7658,8 @@ function selectSym(s) {
 function loadAll() {
   const v = document.getElementById('symInput').value.trim().toUpperCase();
   if (v) currentSym = v;
-  if (currentTab === 'smc')       loadSmc();
+  if (currentTab === 'signal')    loadSignal();
+  else if (currentTab === 'smc')  loadSmc();
   else if (currentTab === 'ict')  loadIct();
   else if (currentTab === 'structure') loadStructure();
   else if (currentTab === 'orb')  loadOrb();
@@ -7633,14 +7668,9 @@ function loadAll() {
   else if (currentTab === 'journal') loadJournal();
 }
 
-// ── Auto-refresh with per-tab intervals ──────────────────────────────────────
-// ORB: every 60s (signal fires once per day, but invalidation check is live)
-// ICT/SMC: every 5min (swing/OTE zones are slow-moving)
-// Structure: every 5min
-// Patterns: every 3min (faster-moving candlestick signals)
-// F&O: every 5min
-// Scanner tabs: on-demand only (too slow to auto-run)
+// ── Auto-refresh intervals ────────────────────────────────────────────────────
 const AUTO_REFRESH_MS = {
+  signal: 3 * 60 * 1000,   // Signal tab: every 3 min (fresh live data)
   smc: 5 * 60 * 1000, ict: 5 * 60 * 1000, structure: 5 * 60 * 1000,
   orb: 60 * 1000, patterns: 3 * 60 * 1000, fno: 5 * 60 * 1000,
 };
@@ -7679,6 +7709,169 @@ function _updateCountdown() {
 const fmtN = v => v == null ? '--' : parseFloat(v).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
 const dirColor = d => (d==='BUY'||d==='LONG') ? 'green' : (d==='SELL'||d==='SHORT') ? 'red' : 'yellow';
 const sigEmoji = d => (d==='BUY'||d==='LONG') ? '[BUY]' : (d==='SELL'||d==='SHORT') ? '[SELL]' : '[WAIT]';
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SIGNAL TAB — Simple live BUY/SELL card
+// ════════════════════════════════════════════════════════════════════════════
+
+async function loadSignal() {
+  const sym = currentSym;
+  const interval = '15minute';
+  document.getElementById('sigSym').textContent = sym;
+  loading('sigBody');
+  try {
+    const r = await fetch(`/api/signal/${encodeURIComponent(sym)}?interval=${interval}`).then(x => x.json());
+    document.getElementById('sigAge').textContent = r.fetched_at ? `Data: ${r.fetched_at}` : '';
+    document.getElementById('sigBody').innerHTML = renderSignalCard(r);
+  } catch(e) {
+    document.getElementById('sigBody').innerHTML = `<p class="red" style="font-size:.78rem">Error: ${e.message}</p>`;
+  }
+}
+
+function renderSignalCard(r) {
+  if (r.error) return `<p class="red" style="font-size:.78rem">${r.error}</p>`;
+
+  const isWait  = r.signal === 'WAIT';
+  const isBuy   = r.signal === 'BUY';
+  const isSell  = r.signal === 'SELL';
+  const dirCol  = isBuy ? 'var(--green)' : isSell ? 'var(--red)' : 'var(--yellow)';
+  const dirBg   = isBuy ? 'rgba(168,255,62,.08)' : isSell ? 'rgba(255,69,96,.08)' : 'rgba(255,209,102,.06)';
+  const dirBord = isBuy ? 'rgba(168,255,62,.3)'  : isSell ? 'rgba(255,69,96,.3)'  : 'rgba(255,209,102,.25)';
+  const qColor  = r.quality === 'A+' ? '#ffd700' : r.quality === 'A' ? 'var(--green)' : 'var(--yellow)';
+
+  if (isWait) {
+    return `
+    <div style="padding:18px;border-radius:10px;background:rgba(255,209,102,.07);border:1px solid rgba(255,209,102,.25);margin-bottom:12px">
+      <div style="font-size:1.2rem;font-weight:800;color:var(--yellow);margin-bottom:6px">WAIT — No clear signal</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:8px">${r.reason || 'Engines disagree. Skip this trade.'}</div>
+      <div style="font-size:.74rem;color:var(--sub)">Current price: <span class="mono" style="color:var(--text)">₹${fmtN(r.current_price)}</span></div>
+      ${r.engines && Object.keys(r.engines).length ? `<div style="margin-top:8px;font-size:.7rem;color:var(--muted)">Engine votes: ${Object.entries(r.engines).map(([k,v])=>`${k}:<span style="color:${v==='BUY'?'var(--green)':'var(--red)'}">${v}</span>`).join(' · ')}</div>` : ''}
+    </div>
+    <div style="font-size:.73rem;color:var(--muted);padding:8px 12px;background:var(--panel2);border-radius:6px">
+      Try another symbol or wait for market structure to develop.
+    </div>`;
+  }
+
+  const inZone = r.in_zone;
+  const entryText = inZone
+    ? `<span style="color:var(--green);font-weight:700">Price is in entry zone NOW</span>`
+    : `Wait for price to reach ₹${fmtN(r.entry_low)} – ₹${fmtN(r.entry_high)}`;
+
+  const warns = (r.warnings || []).map(w =>
+    `<div style="font-size:.7rem;color:var(--yellow);padding:2px 0">⚠ ${w}</div>`).join('');
+
+  const reasons = (r.reasons || []).map(rs =>
+    `<div style="font-size:.71rem;color:var(--sub);padding:2px 0;border-bottom:1px solid var(--border)">${rs}</div>`).join('');
+
+  const engines = Object.entries(r.engines || {}).map(([k,v]) =>
+    `<span style="font-size:.65rem;padding:2px 8px;border-radius:999px;background:${v==='BUY'?'rgba(168,255,62,.15)':'rgba(255,69,96,.15)'};color:${v==='BUY'?'var(--green)':'var(--red)'};margin-right:4px">${k}: ${v}</span>`
+  ).join('');
+
+  const patBadge = r.pattern ? `<span style="font-size:.65rem;padding:2px 8px;border-radius:999px;background:rgba(168,255,62,.1);color:var(--accent);margin-left:4px">${r.pattern}</span>` : '';
+
+  return `
+  <!-- Direction header -->
+  <div style="padding:16px 18px;border-radius:10px;background:${dirBg};border:1px solid ${dirBord};margin-bottom:12px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+      <div style="font-size:1.5rem;font-weight:800;color:${dirCol};letter-spacing:1px">${r.signal}</div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="font-size:.72rem;font-weight:700;color:${qColor};padding:3px 10px;border-radius:999px;border:1px solid ${qColor}">${r.quality || 'B'}</span>
+        <span style="font-size:.72rem;color:var(--sub)">Conf: <b style="color:var(--text)">${r.confidence}%</b></span>
+      </div>
+    </div>
+    <div style="font-size:.76rem;color:var(--sub);margin-bottom:8px">${r.symbol} · ${entryText}</div>
+    <div style="font-size:.7rem">${engines}${patBadge}</div>
+    ${warns ? `<div style="margin-top:10px">${warns}</div>` : ''}
+  </div>
+
+  <!-- Entry zone + SL side by side -->
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+    <div style="background:var(--panel2);border-radius:8px;padding:12px 14px;border:1px solid var(--border)">
+      <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Entry zone</div>
+      <div style="font-size:1.05rem;font-weight:700;color:${dirCol};font-family:'JetBrains Mono',monospace">₹${fmtN(r.entry_low)}</div>
+      <div style="font-size:.7rem;color:var(--sub)">to ₹${fmtN(r.entry_high)}</div>
+      ${inZone ? '<div style="margin-top:4px;font-size:.65rem;color:var(--green);font-weight:700">● IN ZONE</div>' : '<div style="margin-top:4px;font-size:.65rem;color:var(--yellow)">● Waiting</div>'}
+    </div>
+    <div style="background:rgba(255,69,96,.08);border-radius:8px;padding:12px 14px;border:1px solid rgba(255,69,96,.25)">
+      <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Stop Loss — exit if hit</div>
+      <div style="font-size:1.05rem;font-weight:700;color:var(--red);font-family:'JetBrains Mono',monospace">₹${fmtN(r.sl)}</div>
+      ${r.rr_t2 ? `<div style="font-size:.7rem;color:var(--sub)">R:R to T2: <b style="color:${r.rr_t2>=2.5?'var(--green)':r.rr_t2>=2?'var(--yellow)':'var(--red)'}">${r.rr_t2}x</b></div>` : ''}
+    </div>
+  </div>
+
+  <!-- Targets -->
+  <div style="font-size:.63rem;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:6px">Targets — exit in stages</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:12px">
+    ${[['T1','30–40% exit',r.t1,'Fib 1.0'],['T2','Main target',r.t2,'Fib 1.272'],['T3','Runner 20%',r.t3,'Fib 1.618'],['T4','Extended',r.t4,'Fib 2.0']].map(([lbl,sub,val,fib])=>`
+    <div style="background:var(--panel2);border-radius:8px;padding:10px;border:1px solid var(--border);text-align:center">
+      <div style="font-size:.62rem;color:var(--muted);margin-bottom:2px">${lbl} <span style="color:var(--muted);font-size:.58rem">${fib}</span></div>
+      <div style="font-size:.9rem;font-weight:700;color:var(--green);font-family:'JetBrains Mono',monospace">${val ? '₹'+fmtN(val) : '--'}</div>
+      <div style="font-size:.6rem;color:var(--muted);margin-top:2px">${sub}</div>
+    </div>`).join('')}
+  </div>
+
+  <!-- Rule reminder -->
+  <div style="font-size:.72rem;color:var(--sub);padding:10px 12px;background:var(--panel2);border-radius:8px;border-left:3px solid ${dirCol};line-height:1.7">
+    When T1 hits → move Stop Loss to your entry price. You are now risk-free.
+    ${r.rsi_val ? `<span style="margin-left:8px;color:var(--muted)">RSI: ${r.rsi_val}</span>` : ''}
+    ${r.vwap ? `<span style="margin-left:8px;color:var(--muted)">VWAP: ₹${fmtN(r.vwap)}</span>` : ''}
+  </div>
+
+  ${reasons ? `<div style="margin-top:10px;padding:10px 12px;background:var(--panel2);border-radius:8px"><div style="font-size:.65rem;color:var(--accent);margin-bottom:4px">Why this signal</div>${reasons}</div>` : ''}
+  `;
+}
+
+async function runQuickScan() {
+  const interval = document.getElementById('scanInterval2').value;
+  document.getElementById('quickScanBody').innerHTML = '<div style="text-align:center;padding:24px"><div class="spinner"></div><div style="margin-top:8px;font-size:.73rem;color:var(--muted)">Scanning 30+ stocks live from Kite... this takes ~30 seconds</div></div>';
+  document.getElementById('scanAge2').textContent = '';
+  try {
+    const r = await fetch(`/api/quick-scan?interval=${interval}&limit=20`).then(x => x.json());
+    document.getElementById('scanAge2').textContent = r.fetched_at || '';
+    if (r.error) {
+      document.getElementById('quickScanBody').innerHTML = `<p class="red" style="font-size:.78rem">${r.error}</p>`;
+      return;
+    }
+    const sigs = r.signals || [];
+    if (!sigs.length) {
+      document.getElementById('quickScanBody').innerHTML = `<p class="muted" style="font-size:.78rem">No A/A+ signals found across ${r.scanned} stocks right now. Market may be in consolidation.</p>`;
+      return;
+    }
+    let html = `<div style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Found <b style="color:var(--text)">${sigs.length}</b> signals from ${r.scanned} stocks scanned</div>`;
+    html += sigs.map(s => {
+      const isBuy = s.signal === 'BUY';
+      const col   = isBuy ? 'var(--green)' : 'var(--red)';
+      const bg    = isBuy ? 'rgba(168,255,62,.06)' : 'rgba(255,69,96,.06)';
+      const bord  = isBuy ? 'rgba(168,255,62,.25)' : 'rgba(255,69,96,.25)';
+      const qcol  = s.quality === 'A+' ? '#ffd700' : 'var(--green)';
+      return `
+      <div data-sym="${s.symbol}" style="background:${bg};border:1px solid ${bord};border-radius:9px;padding:12px 14px;margin-bottom:8px;cursor:pointer;transition:.15s" onmouseover="this.style.borderColor='${col}'" onmouseout="this.style.borderColor='${bord}'">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <span style="font-size:.95rem;font-weight:800;font-family:'JetBrains Mono',monospace;color:${col}">${s.signal}</span>
+            <span style="font-size:.82rem;font-weight:700;color:var(--text)">${s.symbol}</span>
+            ${s.pattern ? `<span style="font-size:.62rem;padding:1px 6px;border-radius:999px;background:rgba(168,255,62,.1);color:var(--accent)">${s.pattern}</span>` : ''}
+          </div>
+          <div style="display:flex;align-items:center;gap:6px">
+            <span style="font-size:.68rem;font-weight:700;color:${qcol};padding:2px 8px;border-radius:999px;border:1px solid ${qcol}">${s.quality}</span>
+            <span style="font-size:.68rem;color:var(--muted)">${s.confidence}%</span>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px;font-size:.68rem">
+          <div><div style="color:var(--muted)">CMP</div><div style="font-family:'JetBrains Mono',monospace;font-weight:700;color:var(--text)">₹${fmtN(s.current_price)}</div></div>
+          <div><div style="color:var(--muted)">Entry</div><div style="font-family:'JetBrains Mono',monospace;color:${col}">₹${fmtN(s.entry_low)}</div></div>
+          <div><div style="color:var(--muted)">SL</div><div style="font-family:'JetBrains Mono',monospace;color:var(--red)">₹${fmtN(s.sl)}</div></div>
+          <div><div style="color:var(--muted)">T1</div><div style="font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.t1)}</div></div>
+          <div><div style="color:var(--muted)">T2</div><div style="font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.t2)}</div></div>
+        </div>
+        ${s.in_zone ? `<div style="margin-top:6px;font-size:.65rem;color:var(--green);font-weight:700">● Price in entry zone now — click to see full signal</div>` : `<div style="margin-top:4px;font-size:.63rem;color:var(--muted)">Click to see full analysis</div>`}
+      </div>`;
+    }).join('');
+    document.getElementById('quickScanBody').innerHTML = html;
+  } catch(e) {
+    document.getElementById('quickScanBody').innerHTML = `<p class="red" style="font-size:.78rem">Scan error: ${e.message}</p>`;
+  }
+}
 
 function loading(id) {
   document.getElementById(id).innerHTML = '<div style="text-align:center;padding:18px"><div class="spinner"></div><div style="margin-top:7px;font-size:.73rem;color:var(--muted)">Fetching live data...</div></div>';
@@ -8334,6 +8527,280 @@ async def update_journal_entry(entry_id: int, request: Request):
         return {"ok": True, "id": entry_id, "outcome": outcome, "pnl": pnl}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SIMPLE SIGNAL ENGINE  —  Fresh live data, no cache
+#  Combines SMC + ICT + Candlestick Patterns → single BUY / SELL / WAIT
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    Fetch live Kite data, run all 3 engines, return one clean verdict.
+    Intentionally uncached — every call gets fresh market data.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+
+    token = get_instrument_token(symbol)
+    if token is None:
+        return {"error": f"Unknown symbol: {symbol}"}
+
+    # ── Fresh candles (always live) ───────────────────────────────────────────
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, 10)
+    if df.empty or len(df) < 20:
+        with _kite_semaphore:
+            df = kite_manager.get_historical_data(token, interval, 20)
+    if df.empty or len(df) < 15:
+        return {"error": "Insufficient data from Kite — market may be closed"}
+
+    current_price = float(df["close"].iloc[-1])
+
+    # Data freshness
+    try:
+        lct = df["timestamp"].iloc[-1]
+        lct_naive = lct.replace(tzinfo=None) if hasattr(lct, "tzinfo") else lct
+        now_naive = now_ist.replace(tzinfo=None)
+        data_age_min = round((now_naive - lct_naive).total_seconds() / 60, 1)
+    except Exception:
+        data_age_min = 0
+
+    # ── Higher timeframe context ──────────────────────────────────────────────
+    df_1h = df_daily = None
+    try:
+        with _kite_semaphore:
+            df_1h = kite_manager.get_historical_data(token, "60minute", 5)
+    except Exception:
+        pass
+    try:
+        with _kite_semaphore:
+            df_daily = kite_manager.get_historical_data(token, "day", 20)
+    except Exception:
+        pass
+
+    inst = calculate_institutional_levels(df, symbol)
+
+    # ── Run all 3 engines ─────────────────────────────────────────────────────
+    smc_res = ict_res = top_pattern = None
+    pat_signal = "NEUTRAL"
+
+    try:
+        smc_res = smc_engine.analyse(df, symbol, interval, df_1h, inst)
+    except Exception as e:
+        log.warning(f"SMC failed {symbol}: {e}")
+    try:
+        ict_res = ict_engine.analyse(df, symbol, interval, df_daily, inst)
+    except Exception as e:
+        log.warning(f"ICT failed {symbol}: {e}")
+    try:
+        pats = pattern_detector.detect_all_patterns(df, symbol, interval)
+        if pats:
+            top_pattern = pats[0]
+            pat_signal = top_pattern.signal
+    except Exception as e:
+        log.warning(f"Pattern failed {symbol}: {e}")
+
+    # ── Map each engine → BUY / SELL / WAIT ──────────────────────────────────
+    def _dir(s):
+        if s in ("LONG", "BUY", "BULLISH"): return "BUY"
+        if s in ("SHORT", "SELL", "BEARISH"): return "SELL"
+        return "WAIT"
+
+    smc_dir = _dir(smc_res.smc_signal  if smc_res  else "WAIT")
+    ict_dir = _dir(ict_res.ict_signal  if ict_res  else "WAIT")
+    pat_dir = _dir(pat_signal)
+
+    votes = {"BUY": 0, "SELL": 0}
+    engine_votes: Dict[str, str] = {}
+    for eng, d in [("SMC", smc_dir), ("ICT", ict_dir), ("PATTERN", pat_dir)]:
+        if d in votes:
+            votes[d] += 1
+            engine_votes[eng] = d
+
+    # ── Confluence rule: 2+ engines must agree ────────────────────────────────
+    if votes["BUY"] >= 2:
+        final_dir = "BUY"
+    elif votes["SELL"] >= 2:
+        final_dir = "SELL"
+    else:
+        # Try VWAP tiebreak when exactly 1 engine signals
+        vwap_tb = getattr(smc_res, "vwap", None)
+        if vwap_tb and votes["BUY"] == 1 and current_price > vwap_tb * 1.002:
+            final_dir = "BUY"
+        elif vwap_tb and votes["SELL"] == 1 and current_price < vwap_tb * 0.998:
+            final_dir = "SELL"
+        else:
+            return {
+                "symbol": symbol, "signal": "WAIT", "current_price": current_price,
+                "reason": f"Engines disagree — SMC:{smc_dir} ICT:{ict_dir} Pattern:{pat_dir}. Need 2+ to agree.",
+                "engines": engine_votes, "data_age_min": data_age_min,
+                "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+            }
+
+    # ── Extract entry zone / SL / targets (prefer ICT Fib targets) ───────────
+    entry_low = entry_high = sl = t1 = t2 = t3 = t4 = None
+    confidence = 60
+    reasons: List[str] = []
+
+    if ict_res and ict_res.ict_direction in ("LONG", "SHORT"):
+        entry_low  = round(ict_res.ict_entry_low,  2)
+        entry_high = round(ict_res.ict_entry_high, 2)
+        sl         = round(ict_res.ict_sl,  2)
+        t1         = round(ict_res.ict_t1,  2)
+        t2         = round(ict_res.ict_t2,  2)
+        t3         = round(ict_res.ict_t3,  2)
+        t4         = round(ict_res.ict_t4,  2)
+        confidence = round(ict_res.ict_confidence * 100)
+        if ict_res.daily_bias: reasons.append(f"Daily bias: {ict_res.daily_bias}")
+        if ict_res.po3_phase:  reasons.append(f"Po3: {ict_res.po3_phase}")
+
+    # SMC fallback
+    if t1 is None and smc_res:
+        ez = smc_res.smc_entry_zone or [current_price * 0.999, current_price * 1.001]
+        entry_low  = round(min(ez), 2)
+        entry_high = round(max(ez), 2)
+        sl         = round(smc_res.smc_sl, 2)  if smc_res.smc_sl  else None
+        t1         = round(smc_res.smc_t1, 2)  if smc_res.smc_t1  else None
+        t2         = round(smc_res.smc_t2, 2)  if smc_res.smc_t2  else None
+        t3         = round(smc_res.smc_t3, 2)  if smc_res.smc_t3  else None
+        confidence = round(smc_res.smc_confidence)
+
+    # Pattern boost
+    if top_pattern and pat_dir == final_dir:
+        confidence = min(95, confidence + 5)
+        reasons.append(f"Pattern: {top_pattern.pattern.value} ({top_pattern.confidence*100:.0f}%)")
+
+    if smc_res and smc_res.smc_notes:
+        reasons += [n for n in smc_res.smc_notes[:2] if n]
+
+    # ── VWAP filter ───────────────────────────────────────────────────────────
+    vwap_val = getattr(smc_res, "vwap", None)
+    vwap_ok  = True
+    if vwap_val:
+        if final_dir == "BUY"  and current_price < vwap_val and confidence < 85: vwap_ok = False
+        if final_dir == "SELL" and current_price > vwap_val and confidence < 85: vwap_ok = False
+
+    # ── RSI filter ────────────────────────────────────────────────────────────
+    rsi_val = None
+    rsi_ok  = True
+    try:
+        rsi_val = pattern_detector._calc_rsi(df)
+        if final_dir == "BUY"  and rsi_val > 78: rsi_ok = False
+        if final_dir == "SELL" and rsi_val < 22: rsi_ok = False
+    except Exception:
+        pass
+
+    # ── Is price already inside the entry zone? ───────────────────────────────
+    in_zone = bool(entry_low and entry_high and entry_low <= current_price <= entry_high)
+
+    # ── R:R ──────────────────────────────────────────────────────────────────
+    rr = None
+    if t2 and sl and entry_low and entry_high:
+        em   = (entry_low + entry_high) / 2
+        risk = abs(em - sl)
+        if risk > 0:
+            rr = round(abs(t2 - em) / risk, 2)
+
+    # ── Quality grade ─────────────────────────────────────────────────────────
+    quality = "B"
+    if confidence >= 80 and vwap_ok and rsi_ok and (rr or 0) >= 2.0: quality = "A+"
+    elif confidence >= 65 and vwap_ok and rsi_ok:                     quality = "A"
+
+    # ── Warnings ─────────────────────────────────────────────────────────────
+    warnings: List[str] = []
+    if not vwap_ok:          warnings.append("Counter-VWAP — higher risk")
+    if not rsi_ok:           warnings.append("RSI extreme — skip entry")
+    if rr and rr < 2.0:      warnings.append(f"R:R {rr}x below 2x minimum")
+    if data_age_min > 20:    warnings.append(f"Data {data_age_min:.0f} min old — refresh")
+
+    return {
+        "symbol":        symbol,
+        "signal":        final_dir,
+        "quality":       quality,
+        "confidence":    confidence,
+        "current_price": current_price,
+        "entry_low":     entry_low,
+        "entry_high":    entry_high,
+        "sl":            sl,
+        "t1":            t1,
+        "t2":            t2,
+        "t3":            t3,
+        "t4":            t4,
+        "rr_t2":         rr,
+        "in_zone":       in_zone,
+        "vwap":          round(vwap_val, 2) if vwap_val else None,
+        "vwap_ok":       vwap_ok,
+        "rsi_val":       round(rsi_val, 1) if rsi_val else None,
+        "engines":       engine_votes,
+        "reasons":       [r for r in reasons if r][:4],
+        "warnings":      warnings,
+        "data_age_min":  data_age_min,
+        "fetched_at":    now_ist.strftime("%H:%M:%S IST"),
+        "inst_levels":   inst.to_dict() if inst else {},
+        "pattern":       top_pattern.pattern.value if top_pattern else None,
+    }
+
+
+@app.get("/api/signal/{symbol}")
+async def get_simple_signal(symbol: str, interval: str = "15minute"):
+    """Simple BUY/SELL/WAIT — always fresh Kite data, no cache."""
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _compute_simple_signal(symbol, interval))
+        return result
+    except Exception as e:
+        log.error(f"Signal error {symbol}: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/quick-scan")
+async def quick_scan_simple(limit: int = 20, interval: str = "15minute"):
+    """
+    Scan top liquid symbols and return simple BUY/SELL signals.
+    Only A+ and A quality signals returned. Always fresh data.
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    scan_list = [
+        "NIFTY 50", "NIFTY BANK",
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE",
+        "TATAMOTORS", "AXISBANK", "SBIN", "WIPRO", "HCLTECH", "LTM",
+        "TATASTEEL", "VEDL", "COALINDIA", "ONGC", "SAIL", "NATIONALUM",
+        "TVSHLTD", "KPITTECH", "MARUTI", "BAJAJ-AUTO",
+        "TITAN", "SUNPHARMA", "DRREDDY", "APOLLOHOSP",
+        "RVNL", "IRFC", "RECLTD", "ADANIENT",
+    ][:limit + 10]
+
+    results: List[Dict] = []
+
+    def _scan_one(sym: str):
+        try:
+            r = _compute_simple_signal(sym, interval)
+            if r.get("signal") in ("BUY", "SELL") and r.get("quality") in ("A+", "A"):
+                return r
+        except Exception:
+            pass
+        return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_scan_one, s): s for s in scan_list}
+        for f in as_completed(futs, timeout=60):
+            r = f.result()
+            if r:
+                results.append(r)
+
+    results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    return {
+        "scanned":       len(scan_list),
+        "signals_found": len(results),
+        "signals":       results[:limit],
+        "fetched_at":    datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
 
 
 @app.get("/favicon.ico", include_in_schema=False)

@@ -7981,7 +7981,7 @@ async function loadJournal() {
       + entries.map(e => {
           const dc = e.direction === 'BUY' ? 'green' : 'red';
           const entryMid = e.entry_low && e.entry_high ? ((e.entry_low + e.entry_high) / 2).toFixed(2) : '--';
-          return '<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="toggleOutcome(' + e.id + ',\'' + e.outcome + '\')">'
+          return '<tr style="border-bottom:1px solid var(--border);cursor:pointer" data-id="' + e.id + '" data-outcome="' + (e.outcome||'OPEN') + '" onclick="toggleOutcome(this.dataset.id,this.dataset.outcome)">'
             + '<td style="padding:4px 6px;color:var(--muted)">' + (e.ts || '').slice(0, 16) + '</td>'
             + '<td style="padding:4px 6px;font-weight:700">' + e.symbol + '</td>'
             + '<td style="padding:4px 6px;text-align:center"><span class="' + dc + '">' + e.direction + '</span></td>'

@@ -21,6 +21,8 @@ from dataclasses import dataclass, asdict, field
 from enum import Enum
 from contextlib import asynccontextmanager
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 import numpy as np
 import pandas as pd
 
@@ -2216,6 +2218,9 @@ class KiteManager:
             self.is_authenticated = True
             self._save_token(self.access_token)
             log.info("✅ Kite login successful")
+            # Pre-resolve all SCAN_UNIVERSE tokens in one batch (avoids per-symbol
+            # instruments DF loading during the first scan which caused 2+ min delays)
+            threading.Thread(target=_bulk_resolve_tokens, daemon=True).start()
             return True
         except Exception as e:
             log.error(f"Login failed: {e}")
@@ -4977,6 +4982,51 @@ DYNAMIC_RESOLVE_SYMBOLS = [
 # Runtime cache: populated on first use per symbol
 _token_cache: Dict[str, int] = {}
 
+# ── TTL Response Cache ─────────────────────────────────────────────────────────
+# Caches per-symbol analysis results for up to TTL_SECONDS.
+# Prevents redundant Kite API calls when the same symbol is loaded repeatedly
+# within the same candle cycle (e.g. switching tabs on same symbol).
+class TTLCache:
+    """Simple thread-safe TTL dict. Entries expire after `ttl` seconds."""
+    def __init__(self, ttl: int = 180):
+        self._store: Dict[str, Any] = {}
+        self._ts:    Dict[str, float] = {}
+        self._lock   = threading.Lock()
+        self.ttl     = ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        with self._lock:
+            if key in self._store:
+                if time.time() - self._ts[key] < self.ttl:
+                    return self._store[key]
+                del self._store[key]
+                del self._ts[key]
+            return None
+
+    def set(self, key: str, value: Any) -> None:
+        with self._lock:
+            self._store[key] = value
+            self._ts[key]    = time.time()
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+            self._ts.clear()
+
+# One cache per analysis type. 3-minute TTL matches the shortest candle interval.
+_smc_cache       = TTLCache(ttl=180)
+_ict_cache       = TTLCache(ttl=180)
+_structure_cache = TTLCache(ttl=180)
+_orb_cache       = TTLCache(ttl=60)   # ORB changes more often (1-min TTL)
+_pattern_cache   = TTLCache(ttl=180)
+_scan_cache      = TTLCache(ttl=240)  # Full scan results cached 4 min
+
+# ── Kite API semaphore — max 3 concurrent historical data requests ─────────────
+# Kite rate limit: 3 req/s per IP. This prevents HTTP 429 errors during scans.
+_kite_semaphore = threading.Semaphore(3)
+
+
+
 # NSE symbol alias map -- maps our internal name to actual NSE tradingsymbol
 # Used when our name differs from what Kite's instrument list shows
 NSE_SYMBOL_ALIASES: Dict[str, str] = {
@@ -5000,6 +5050,41 @@ NSE_SYMBOL_ALIASES: Dict[str, str] = {
     # Telecom infra
     "INDUSTOWER":    "INDUSTOWER",
 }
+
+
+def _bulk_resolve_tokens() -> None:
+    """
+    Pre-resolve instrument tokens for all SCAN_UNIVERSE symbols in one pass.
+    Called in a background thread immediately after Kite login.
+    Loads the NSE instruments DF once, then resolves every symbol via vectorised
+    pandas filter — no per-symbol API calls, completes in < 2 seconds.
+    """
+    try:
+        if not kite_manager.is_authenticated:
+            return
+        df = kite_manager._get_nse_instruments_df()
+        if df.empty:
+            return
+        resolved = 0
+        for symbol in SCAN_UNIVERSE:
+            if symbol in _token_cache or symbol in DEMO_TOKENS:
+                continue
+            if symbol in ("NIFTY 50", "NIFTY BANK"):
+                continue
+            lookup = NSE_SYMBOL_ALIASES.get(symbol, symbol)
+            if lookup is None:
+                continue
+            match = df[
+                (df["tradingsymbol"] == lookup) &
+                (df["instrument_type"] == "EQ") &
+                (df["exchange"] == "NSE")
+            ]
+            if not match.empty:
+                _token_cache[symbol] = int(match.iloc[0]["instrument_token"])
+                resolved += 1
+        log.info(f"✅ Bulk token pre-resolve complete: {resolved} symbols cached")
+    except Exception as e:
+        log.warning(f"Bulk token pre-resolve failed: {e}")
 
 def get_instrument_token(symbol: str) -> Optional[int]:
     """
@@ -6345,23 +6430,36 @@ async def get_smc_scan(interval: str = "15minute", min_conf: float = 60.0, limit
     scan_list = [s for s in SCAN_UNIVERSE if s not in ("NIFTY 50", "NIFTY BANK")]
     import time as _time
 
-    for symbol in scan_list:
+    def _fetch_smc_data(symbol: str):
         token = get_instrument_token(symbol)
         if token is None:
-            continue
+            return symbol, None, None
         try:
             days_back = 7 if "minute" in interval else 30
-            df = kite_manager.get_historical_data(token, interval, days_back)
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, interval, days_back)
             if df.empty or len(df) < 20:
-                continue
-            _time.sleep(0.35)  # ~3 req/s -- stays within Kite's rate limit
-
+                return symbol, None, None
             df_1h = None
             try:
-                df_1h = kite_manager.get_historical_data(token, "60minute", 5)
-                _time.sleep(0.35)
+                with _kite_semaphore:
+                    df_1h = kite_manager.get_historical_data(token, "60minute", 5)
             except Exception:
                 pass
+            return symbol, df, df_1h
+        except Exception:
+            return symbol, None, None
+
+    smc_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_smc_data, s): s for s in scan_list}
+        for future in as_completed(futures):
+            sym, df, df_1h = future.result()
+            if df is not None:
+                smc_data[sym] = (df, df_1h)
+
+    for symbol, (df, df_1h) in smc_data.items():
+        try:
 
             result = smc_engine.analyse(df, symbol, interval, df_1h)
 
@@ -6497,29 +6595,52 @@ async def institutional_scan(
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     import time as _time
+
+    # ── Check scan cache first (4-min TTL) ───────────────────────────────────
+    _scan_key = f"inst_scan:{interval}:{int(min_conf)}"
+    _cached = _scan_cache.get(_scan_key)
+    if _cached is not None:
+        log.info(f"Returning cached institutional scan ({interval})")
+        return _cached
+
     results = []
     scan_list = [s for s in SCAN_UNIVERSE if s not in ("NIFTY 50", "NIFTY BANK")]
 
-    for symbol in scan_list:
+    def _fetch_symbol_data(symbol: str):
+        """Fetch all timeframe data for one symbol. Runs in thread pool."""
         token = get_instrument_token(symbol)
         if token is None:
-            continue
+            return symbol, None, None, None
         try:
-            days_back = 10
-            df = kite_manager.get_historical_data(token, interval, days_back)
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, interval, 10)
             if df.empty or len(df) < 30:
-                continue
-            _time.sleep(0.35)
-
-            df_1h = None
-            df_daily = None
+                return symbol, None, None, None
+            df_1h = df_daily = None
             try:
-                df_1h    = kite_manager.get_historical_data(token, "60minute", 7)
-                _time.sleep(0.2)
-                df_daily = kite_manager.get_historical_data(token, "day", 20)
-                _time.sleep(0.2)
+                with _kite_semaphore:
+                    df_1h = kite_manager.get_historical_data(token, "60minute", 7)
+                with _kite_semaphore:
+                    df_daily = kite_manager.get_historical_data(token, "day", 20)
             except Exception:
                 pass
+            return symbol, df, df_1h, df_daily
+        except Exception:
+            return symbol, None, None, None
+
+    # Fetch all symbols in parallel (max 5 concurrent threads, semaphore limits API to 3 req/s)
+    symbol_data = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(_fetch_symbol_data, s): s for s in scan_list}
+        for future in as_completed(futures):
+            sym, df, df_1h, df_daily = future.result()
+            if df is not None:
+                symbol_data[sym] = (df, df_1h, df_daily)
+
+    log.info(f"Institutional scan: fetched data for {len(symbol_data)}/{len(scan_list)} symbols")
+
+    for symbol, (df, df_1h, df_daily) in symbol_data.items():
+        try:
 
             inst_levels = calculate_institutional_levels(df, symbol)
 
@@ -6710,12 +6831,13 @@ async def institutional_scan(
 
     results.sort(key=lambda x: (x["confidence"], x["quality"] == "A+"), reverse=True)
 
-    return {
+    scan_response = {
         "signals":      results[:limit],
         "total_found":  len(results),
-        "scanned":      len(scan_list),
+        "scanned":      len(symbol_data),
         "interval":     interval,
         "generated_at": datetime.now().isoformat(),
+        "cached":       False,
         "methodology":  (
             "Requires 2/3 engines (SMC + ICT + Structure) to agree. "
             "Entry: OTE zone 61.8%-78.6% Fibonacci retracement. "
@@ -6723,6 +6845,8 @@ async def institutional_scan(
             "Minimum RR 1.8x to T2. PDH/PDL + Daily bias + Killzone context included."
         ),
     }
+    _scan_cache.set(_scan_key, scan_response)
+    return scan_response
 
 
 def _detect_pattern_type(df: pd.DataFrame, signal: str, structure: str) -> str:

@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║           ALGOTRADE PRO ULTIMATE v3.0 - ADVANCED PATTERNS & FIB              ║
+║           ALGOTRADE PRO ULTIMATE v4.0 - ADVANCED PATTERNS & FIB              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  ✓ 50+ Candlestick Pattern Detection (Real-time)                            ║
 ║  ✓ Fibonacci Analysis (Retracements, Extensions, Fans, Arcs)                ║
@@ -352,9 +352,9 @@ class CandlestickPatternDetector:
             if not prior_downtrend:
                 continue
 
-            # Volume: is this candle above average?
-            avg_vol = float(df['volume'].iloc[max(0,i-20):i].mean()) if has_vol else 1
-            vol_ratio = float(candle['volume']) / avg_vol if has_vol and avg_vol > 0 else 1.0
+            # Volume: is this candle above average? (session-aware via _avg_volume)
+            avg_vol  = self._avg_volume(df, i)
+            vol_ratio = float(candle['volume']) / avg_vol if 'volume' in df.columns and avg_vol > 0 else 1.0
 
             atr = self._calculate_atr(df, i)
 
@@ -415,7 +415,7 @@ class CandlestickPatternDetector:
             prior_uptrend = all(float(prior.iloc[j]['close']) < float(prior.iloc[j+1]['close']) for j in range(len(prior)-1))
             if not prior_uptrend:
                 continue
-            avg_vol   = float(df['volume'].iloc[max(0,i-20):i].mean()) if has_vol else 1
+            avg_vol   = self._avg_volume(df, i)
             vol_ratio = float(candle['volume']) / avg_vol if has_vol and avg_vol > 0 else 1.0
             if upper_wick >= body * 2 and lower_wick <= body * 0.5 and body / total_range < 0.35:
                 wick_ratio = upper_wick / body
@@ -1113,11 +1113,39 @@ class CandlestickPatternDetector:
         return hl_sum / max(1, idx - start)
 
     def _avg_volume(self, df: pd.DataFrame, idx: int, period: int = 20) -> float:
-        """Pre-compute average volume up to idx."""
+        """Average volume up to idx, restricted to the same trading session.
+
+        FIX: The old implementation took the last `period` bars regardless of
+        date, mixing yesterday's low closing-hour volume with today's high
+        opening volume and making vol_ratio meaningless for intraday signals.
+        Now we prefer bars from the same calendar date; only fall back to
+        cross-session bars when fewer than 5 same-session bars are available.
+        """
         if 'volume' not in df.columns:
             return 1.0
+        # Determine the date of the bar at idx
+        try:
+            bar_ts = df.iloc[idx]['timestamp']
+            bar_date = pd.Timestamp(bar_ts).date()
+        except Exception:
+            bar_date = None
+
+        # Collect candidate bars before idx
         start = max(0, idx - period)
-        vals = [float(df.iloc[j]['volume']) for j in range(start, idx) if float(df.iloc[j]['volume']) > 0]
+        if bar_date is not None:
+            # Prefer same-session bars
+            same_session = [
+                float(df.iloc[j]['volume'])
+                for j in range(start, idx)
+                if float(df.iloc[j]['volume']) > 0
+                and pd.Timestamp(df.iloc[j]['timestamp']).date() == bar_date
+            ]
+            if len(same_session) >= 5:
+                return sum(same_session) / len(same_session)
+
+        # Fallback: all bars in window
+        vals = [float(df.iloc[j]['volume']) for j in range(start, idx)
+                if float(df.iloc[j]['volume']) > 0]
         return sum(vals) / len(vals) if vals else 1.0
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1603,7 +1631,29 @@ class ICTEngine:
         Find the most recent significant swing (last clear HH or LL).
         Returns (swing_high, swing_low, direction).
         Uses 3-bar pivot with 0.3% ATR-normalized threshold.
+
+        FIX: When the market has been open for at least 45 minutes (i.e. after
+        10:00 AM IST), intraday structure is reliable enough to use.  We
+        restrict the swing search to today's session bars first; this prevents
+        yesterday's distant swing from setting wildly off Fib targets intraday.
+        Falls back to the full 80-bar window when today's session has < 10 bars.
         """
+        now = datetime.now()
+        session_start = now.replace(hour=10, minute=0, second=0, microsecond=0)
+        use_session_only = now >= session_start
+
+        if use_session_only and 'timestamp' in df.columns:
+            try:
+                today = now.date()
+                today_mask = df['timestamp'].apply(
+                    lambda x: pd.Timestamp(x).date() == today
+                )
+                today_df = df[today_mask]
+                if len(today_df) >= 10:
+                    df = today_df.reset_index(drop=True)
+            except Exception:
+                pass  # fall through to full window
+
         n = min(len(df), 80)
         sub = df.tail(n).reset_index(drop=True)
         highs  = sub["high"].values.astype(float)
@@ -3333,6 +3383,13 @@ class ORBEngine:
             confidence=confidence, notes=notes,
             generated_at=datetime.now().isoformat(),
         )
+
+
+# ── ORB Daily Signal Cache ────────────────────────────────────────────────────
+# Stores the first confirmed ORBSignal per (symbol, date) so that subsequent
+# API calls within the same session always return the original signal rather
+# than a potentially shifted re-computation (avoids intraday signal flipping).
+_orb_cache: Dict[str, Any] = {}   # key: "SYMBOL:YYYY-MM-DD"  value: ORBSignal
 
 
 orb_engine = ORBEngine()
@@ -5186,9 +5243,58 @@ def get_instrument_token(symbol: str) -> Optional[int]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("🚀 AlgoTrade Pro Enhanced starting...")
+    log.info("🚀 AlgoTrade Pro Ultimate v4.0 starting...")
+    # ── Fix #11: Start dynamic universe enrichment background task ────────────
+    # Runs every 30 min during market hours; enriches SCAN_UNIVERSE with live
+    # top movers / high-volume stocks from Kite so the scanner is never stale.
+    async def _refresh_dynamic_universe():
+        global _dynamic_universe, _universe_fetched_at
+        while True:
+            try:
+                now = datetime.now()
+                market_open  = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                market_close = now.replace(hour=15, second=0, microsecond=0)
+                if market_open <= now <= market_close and kite_manager.is_authenticated:
+                    nse_syms = [f"NSE:{s}" for s in SCAN_UNIVERSE
+                                if s not in ("NIFTY 50", "NIFTY BANK")]
+                    batch_size = 100
+                    all_quotes: Dict[str, Any] = {}
+                    for i in range(0, len(nse_syms), batch_size):
+                        batch = nse_syms[i:i + batch_size]
+                        try:
+                            q = kite_manager.get_quote(batch) or {}
+                            all_quotes.update(q)
+                        except Exception:
+                            pass
+                    if all_quotes:
+                        # Sort by % change (abs) descending — surface most volatile
+                        def _pct(q):
+                            ltp  = float(q.get("last_price") or 0)
+                            prev = float(q.get("ohlc", {}).get("close") or ltp or 1)
+                            return abs((ltp - prev) / prev * 100) if prev else 0
+                        sorted_syms = sorted(
+                            all_quotes.items(),
+                            key=lambda kv: _pct(kv[1]),
+                            reverse=True
+                        )
+                        top_movers = [
+                            kv[0].replace("NSE:", "")
+                            for kv in sorted_syms[:30]
+                            if kv[0].replace("NSE:", "") not in ("NIFTY 50", "NIFTY BANK")
+                        ]
+                        # Merge with base universe (top movers first for scanner priority)
+                        merged = top_movers + [s for s in SCAN_UNIVERSE if s not in top_movers]
+                        _dynamic_universe = merged
+                        _universe_fetched_at = datetime.now()
+                        log.info(f"🔄 Dynamic universe updated: {len(merged)} symbols, top movers: {top_movers[:5]}")
+            except Exception as e:
+                log.warning(f"Dynamic universe refresh error: {e}")
+            await asyncio.sleep(30 * 60)  # 30 minutes
+
+    task = asyncio.create_task(_refresh_dynamic_universe())
     yield
-    log.info("🛑 AlgoTrade Pro Enhanced shutting down...")
+    task.cancel()
+    log.info("🛑 AlgoTrade Pro Ultimate v4.0 shutting down...")
 
 app = FastAPI(title="AlgoTrade Pro Enhanced", lifespan=lifespan)
 _CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
@@ -5216,9 +5322,13 @@ async def health_check():
     """Railway health check endpoint. Returns 200 if service is running."""
     return {
         "status": "ok",
-        "service": "AlgoTrade Pro Enhanced",
-        "version": "3.0",
+        "service": "AlgoTrade Pro Ultimate",
+        "version": "4.0",
         "kite_connected": kite_manager.is_authenticated,
+        "universe_size": len(_dynamic_universe) if _dynamic_universe else len(SCAN_UNIVERSE),
+        "universe_source": "dynamic" if _dynamic_universe else "static",
+        "universe_refreshed_at": _universe_fetched_at.isoformat() if _universe_fetched_at else None,
+        "orb_cache_entries": len(_orb_cache),
         "timestamp": datetime.now().isoformat()
     }
 
@@ -5986,13 +6096,14 @@ async def get_orb(symbol: str, interval: str = "5minute"):
     Opening Range Breakout signal.
     ORB range = High/Low of 9:15-9:29 candles today.
     Breakout = first 9:30+ candle that CLOSES beyond the range with volume.
+    Once a signal fires for the day it is cached — subsequent calls return
+    the original signal so intraday data jitter cannot flip the levels.
     """
     if not kite_manager.is_authenticated:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
 
     sym_clean = symbol.replace(" 50", "").replace("NIFTY BANK", "BANKNIFTY").replace("NIFTY", "NIFTY")
     if "NIFTY" in symbol.upper():
-        # Use index token
         token = DEMO_TOKENS.get(symbol) or DEMO_TOKENS.get("NIFTY 50")
     else:
         token = get_instrument_token(symbol)
@@ -6008,11 +6119,28 @@ async def get_orb(symbol: str, interval: str = "5minute"):
     if df.empty or len(df) < 5:
         return JSONResponse({"error": "Insufficient data -- market may not be open yet"}, status_code=404)
 
+    # ── Check daily ORB cache first ───────────────────────────────────────────
+    today_str  = datetime.now().strftime("%Y-%m-%d")
+    cache_key  = f"{symbol}:{today_str}"
+    cached_sig = _orb_cache.get(cache_key)
+
     try:
         signal = orb_engine.detect(df, symbol, interval)
     except Exception as e:
         log.error(f"ORB detect error for {symbol}: {e}")
         return JSONResponse({"error": f"ORB analysis error: {e}"}, status_code=500)
+
+    # If a signal fired for the first time today, store it in cache
+    if signal is not None and cached_sig is None:
+        _orb_cache[cache_key] = signal
+        log.info(f"📦 ORB signal cached for {symbol} ({today_str})")
+    elif signal is None and cached_sig is not None:
+        # Reuse today's cached signal — data jitter cleared the live signal
+        signal = cached_sig
+        log.info(f"♻️  ORB using cached signal for {symbol} ({today_str})")
+    elif cached_sig is not None:
+        # Both present — always serve cached (original) signal to prevent flipping
+        signal = cached_sig
 
     if signal is None:
         # Return info about current ORB range even if no breakout yet
@@ -6650,10 +6778,12 @@ async def institutional_scan(
         return _cached
 
     results = []
-    scan_list = [s for s in SCAN_UNIVERSE if s not in ("NIFTY 50", "NIFTY BANK")]
+    # Fix #11: prefer _dynamic_universe (top movers first) when populated by
+    # the background enrichment task; fall back to static SCAN_UNIVERSE.
+    _base = _dynamic_universe if _dynamic_universe else SCAN_UNIVERSE
+    scan_list = [s for s in _base if s not in ("NIFTY 50", "NIFTY BANK")]
 
     def _fetch_symbol_data(symbol: str):
-        """Fetch all timeframe data for one symbol. Runs in thread pool."""
         token = get_instrument_token(symbol)
         if token is None:
             return symbol, None, None, None
@@ -6823,8 +6953,9 @@ async def institutional_scan(
             key_notes.append(f"Confluence: {confluence_score}/5")
 
             # Enforce minimum RR 1.5x to T2 -- below this, risk/reward is poor
-            _rr_ok = (rr_t2 >= 1.5) if rr_t2 > 0 else True
-            if not _rr_ok:
+            # FIX: rr_t2 == 0 means the signal is in WAIT state (no real setup);
+            # the old `else True` let these ghost signals pass through.
+            if rr_t2 <= 0 or rr_t2 < 1.5:
                 continue
 
             # ── ACCURACY IMPROVEMENT 4: Market hours tag ──────────────────────
@@ -7111,6 +7242,7 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
   <div class="auth-bar">
     <div id="authDot" class="dot"></div>
     <span id="authLabel" style="color:var(--muted);font-size:.76rem">Checking...</span>
+    <span id="arCountdown" style="color:var(--accent);font-size:.7rem;min-width:50px;text-align:right" title="Auto-refresh countdown"></span>
     <a id="loginBtn" href="/auth/login" style="display:none;background:var(--accent);color:#000;padding:3px 11px;border-radius:5px;font-size:.73rem;font-weight:700;text-decoration:none">Login Kite</a>
     <a id="logoutBtn" href="/auth/logout" style="display:none;color:var(--muted);font-size:.7rem;padding:2px 8px;border:1px solid var(--border);border-radius:4px;text-decoration:none">Logout</a>
   </div>
@@ -7123,6 +7255,7 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
   <div class="tab" data-tab="orb">ORB</div>
   <div class="tab" data-tab="patterns">Patterns</div>
   <div class="tab" data-tab="fno">F&O</div>
+  <div class="tab" data-tab="journal">Journal</div>
   <div class="tab" data-tab="guide">Guide</div>
 </div>
 <div class="main">
@@ -7153,6 +7286,9 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
           <select id="scanMinConf" class="btn" style="padding:4px 9px">
             <option value="65">Conf 65+</option><option value="75">Conf 75+</option><option value="80">Conf 80+</option>
           </select>
+          <select id="scanLimit" class="btn" style="padding:4px 9px" title="Max results to show">
+            <option value="5">Top 5</option><option value="10" selected>Top 10</option><option value="20">Top 20</option><option value="50">Top 50</option>
+          </select>
           <button class="btn primary" onclick="runScan()">Run Institutional Scan</button>
           <button class="btn" onclick="runSmcScan()">SMC Quick Scan</button>
         </div>
@@ -7163,16 +7299,28 @@ header h1{font-size:1rem;color:var(--accent);font-weight:800;letter-spacing:.5px
       <div class="card"><div class="card-title">ORB -- <span id="orbSym">--</span></div><div id="orbBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-patterns">
-      <div class="card"><div class="card-title">Patterns & Fibonacci -- <span id="patSym">--</span></div><div id="patBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
+      <div class="card"><div class="card-title" style="display:flex;align-items:center;justify-content:space-between">Patterns & Fibonacci -- <span id="patSym">--</span><label style="font-size:.68rem;color:var(--muted);font-weight:400;cursor:pointer"><input id="hideNeutralChk" type="checkbox" checked onchange="loadPatterns()" style="margin-right:4px">Hide Neutral</label></div><div id="patBody"><p class="muted" style="font-size:.78rem">Select a symbol.</p></div></div>
     </div>
     <div class="tab-content" id="tab-fno">
       <div class="card"><div class="card-title">F&O Signals -- <span id="fnoSym">--</span></div><div id="fnoBody"><p class="muted" style="font-size:.78rem">Select an F&O symbol (NIFTY, BANKNIFTY, RELIANCE...)</p></div></div>
+    </div>
+    <div class="tab-content" id="tab-journal">
+      <div class="card">
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+          Trade Journal
+          <div style="display:flex;gap:6px">
+            <button class="btn" onclick="loadJournal()">↻ Refresh</button>
+            <button class="btn" onclick="exportJournal()" style="font-size:.68rem">⬇ Export CSV</button>
+          </div>
+        </div>
+        <div id="journalBody"><p class="muted" style="font-size:.78rem">Loading journal...</p></div>
+      </div>
     </div>
     <div class="tab-content" id="tab-guide">
       <div class="card">
         <div class="card-title">Institutional Trading Guide -- v4.0</div>
         <div style="font-size:.78rem;line-height:1.7">
-          <p class="yellow" style="font-weight:700;margin-bottom:6px">What was fixed in v4.0:</p>
+          <p class="yellow" style="font-weight:700;margin-bottom:6px">What was fixed and added in v4.0:</p>
           <p class="muted" style="margin-bottom:10px">Previous version had ALL targets in WRONG ORDER -- T1 was furthest, T2 was closest. Now fully corrected.</p>
           <p class="accent" style="font-weight:700;margin:8px 0 5px">Fibonacci Target Cascade (CORRECT ORDER):</p>
           <table style="width:100%;border-collapse:collapse;font-size:.72rem;margin-bottom:12px">
@@ -7211,7 +7359,7 @@ document.querySelectorAll('.tab').forEach(t => {
     document.querySelectorAll('.tab-content').forEach(x => x.classList.remove('active'));
     t.classList.add('active'); currentTab = t.dataset.tab;
     document.getElementById('tab-' + currentTab).classList.add('active');
-    setTimeout(loadAll, 50);
+    setTimeout(() => { loadAll(); _startAutoRefresh(); }, 50);
   });
 });
 
@@ -7227,7 +7375,16 @@ function selectSym(s) {
   currentSym = s;
   document.getElementById('symInput').value = s;
   document.querySelectorAll('.sym-item').forEach(el => el.classList.toggle('active', el.textContent === s));
+  // FIX: clear the active panel instantly so stale data from the previous
+  // symbol is never readable while the new request is in-flight.
+  const panelMap = {
+    smc: 'smcBody', ict: 'ictBody', structure: 'structureBody',
+    orb: 'orbBody', patterns: 'patBody', fno: 'fnoBody', journal: 'journalBody',
+  };
+  const panelId = panelMap[currentTab];
+  if (panelId) loading(panelId);
   loadAll();
+  _startAutoRefresh();
 }
 
 function loadAll() {
@@ -7239,6 +7396,50 @@ function loadAll() {
   else if (currentTab === 'orb')  loadOrb();
   else if (currentTab === 'patterns') loadPatterns();
   else if (currentTab === 'fno')  loadFno();
+  else if (currentTab === 'journal') loadJournal();
+}
+
+// ── Auto-refresh with per-tab intervals ──────────────────────────────────────
+// ORB: every 60s (signal fires once per day, but invalidation check is live)
+// ICT/SMC: every 5min (swing/OTE zones are slow-moving)
+// Structure: every 5min
+// Patterns: every 3min (faster-moving candlestick signals)
+// F&O: every 5min
+// Scanner tabs: on-demand only (too slow to auto-run)
+const AUTO_REFRESH_MS = {
+  smc: 5 * 60 * 1000, ict: 5 * 60 * 1000, structure: 5 * 60 * 1000,
+  orb: 60 * 1000, patterns: 3 * 60 * 1000, fno: 5 * 60 * 1000,
+};
+let _arTimer = null, _arCountdown = null, _arSecondsLeft = 0;
+
+function _startAutoRefresh() {
+  _stopAutoRefresh();
+  const ms = AUTO_REFRESH_MS[currentTab];
+  if (!ms) return;
+  _arSecondsLeft = ms / 1000;
+  _updateCountdown();
+  _arCountdown = setInterval(() => {
+    _arSecondsLeft--;
+    _updateCountdown();
+    if (_arSecondsLeft <= 0) {
+      loadAll();
+      _arSecondsLeft = ms / 1000;
+    }
+  }, 1000);
+}
+
+function _stopAutoRefresh() {
+  if (_arTimer)    { clearInterval(_arTimer);    _arTimer    = null; }
+  if (_arCountdown){ clearInterval(_arCountdown); _arCountdown = null; }
+  const el = document.getElementById('arCountdown');
+  if (el) el.textContent = '';
+}
+
+function _updateCountdown() {
+  const el = document.getElementById('arCountdown');
+  if (!el) return;
+  const m = Math.floor(_arSecondsLeft / 60), s = _arSecondsLeft % 60;
+  el.textContent = `↻ ${m}:${String(s).padStart(2,'0')}`;
 }
 
 const fmtN = v => v == null ? '--' : parseFloat(v).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
@@ -7443,10 +7644,11 @@ async function loadStructure() {
 
 async function runScan() {
   const interval = document.getElementById('scanInterval').value;
-  const minConf = document.getElementById('scanMinConf').value;
+  const minConf  = document.getElementById('scanMinConf').value;
+  const limit    = document.getElementById('scanLimit').value;  // FIX #10
   loading('scanBody');
   try {
-    const r = await fetch('/api/institutional-scan?interval=' + interval + '&min_conf=' + minConf + '&limit=25').then(r => r.json());
+    const r = await fetch('/api/institutional-scan?interval=' + interval + '&min_conf=' + minConf + '&limit=' + limit).then(r => r.json());
     if (r.error) { document.getElementById('scanBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signals || r.signals.length === 0) {
       document.getElementById('scanBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">No setups found</div><div class="muted" style="font-size:.73rem;margin-top:3px">Scanned ' + r.scanned + ' symbols. No multi-engine confluence. Try lower confidence or different interval.</div></div>';
@@ -7528,7 +7730,14 @@ async function loadPatterns() {
       fetch('/api/fibonacci/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json()),
     ]);
     if (pr.error) { document.getElementById('patBody').innerHTML = '<p class="red">' + pr.error + '</p>'; return; }
-    const patterns = pr.patterns || [];
+    let patterns = pr.patterns || [];
+
+    // FIX #7: filter toggle state
+    const hideNeutral = document.getElementById('hideNeutralChk') && document.getElementById('hideNeutralChk').checked;
+    if (hideNeutral) patterns = patterns.filter(p => p.signal !== 'NEUTRAL');
+    // Always enforce minimum 65% confidence for non-NEUTRAL to reduce noise
+    patterns = patterns.filter(p => p.signal === 'NEUTRAL' || (p.confidence * 100) >= 65);
+
     const patHtml = patterns.length ? patterns.map(p =>
       '<div class="scan-item ' + p.signal + '">'
       + '<div class="scan-hdr"><span class="scan-sym" style="font-size:.82rem">' + p.pattern + '</span>'
@@ -7538,7 +7747,7 @@ async function loadPatterns() {
       + '<span class="scan-t">Entry: Rs.' + fmtN(p.price_at_detection) + '</span>'
       + '<span class="scan-t">SL: <b class="red">Rs.' + fmtN(p.stop_loss) + '</b></span>'
       + '<span class="scan-t">T: <b class="green">Rs.' + fmtN(p.target) + '</b></span></div></div>').join('')
-      : '<div class="muted" style="font-size:.78rem;padding:7px">No patterns detected.</div>';
+      : '<div class="muted" style="font-size:.78rem;padding:7px">No patterns detected (try unchecking "Hide Neutral").</div>';
     let fibHtml = '';
     if (!fr.error && fr.retracements) {
       fibHtml = '<div class="card" style="margin-top:8px"><div class="card-title">Fibonacci Levels</div>'
@@ -7564,19 +7773,174 @@ async function loadFno() {
     document.getElementById('fnoBody').innerHTML = sigs.map(s => {
       if (s.error) return '<div class="red" style="font-size:.78rem;padding:7px">' + s.error + '</div>';
       const dc = s.direction && s.direction.includes('CALL') ? 'green' : 'red';
+      // FIX #8: show capital required = option_price × lot_size so traders
+      // can immediately see margin needed before acting on the signal.
+      const capitalNeeded = (s.option_price && s.lot_size)
+        ? 'Rs.' + fmtN(s.option_price * s.lot_size)
+        : '--';
+      const maxLoss = (s.option_sl && s.lot_size)
+        ? 'Rs.' + fmtN(Math.abs(s.option_price - s.option_sl) * s.lot_size)
+        : '--';
       return '<div class="scan-item ' + (s.direction&&s.direction.includes('CALL')?'BUY':'SELL') + '" style="margin-bottom:7px">'
         + '<div class="scan-hdr"><span class="scan-sym" style="font-size:.83rem">' + s.symbol + ' ' + s.strike + ' ' + s.option_type + '</span><span class="' + dc + '" style="font-size:.73rem">' + s.direction + '</span></div>'
         + '<div style="font-size:.7rem;color:var(--muted);margin-bottom:4px">Expiry: ' + s.expiry_str + ' (' + s.expiry_type + ') | Lot: ' + s.lot_size + '</div>'
         + '<div class="scan-targets"><span class="scan-t">LTP: <b>Rs.' + fmtN(s.option_price) + '</b></span><span class="scan-t">SL: <b class="red">Rs.' + fmtN(s.option_sl) + '</b></span><span class="scan-t">T: <b class="green">Rs.' + fmtN(s.option_target) + '</b></span><span class="scan-t">RR: <b>' + s.rr + '</b></span></div>'
+        + '<div style="font-size:.68rem;margin-top:5px;display:flex;gap:12px;flex-wrap:wrap">'
+        + '<span>💰 Capital needed: <b class="yellow">' + capitalNeeded + '</b></span>'
+        + '<span>⚠️ Max loss/lot: <b class="red">' + maxLoss + '</b></span>'
+        + '</div>'
         + '</div>';
     }).join('');
   } catch(e) { document.getElementById('fnoBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
-setTimeout(() => selectSym('RELIANCE'), 600);
+// ── Trade Journal ─────────────────────────────────────────────────────────────
+async function loadJournal() {
+  loading('journalBody');
+  try {
+    const r = await fetch('/api/journal?limit=50').then(r => r.json());
+    if (r.error) { document.getElementById('journalBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+    const entries = r.entries || [];
+    if (!entries.length) {
+      document.getElementById('journalBody').innerHTML =
+        '<div class="muted" style="font-size:.78rem;padding:10px">No journal entries yet. Signals will appear here as they fire.</div>';
+      return;
+    }
+    const outcomeColor = o => o === 'WIN' ? 'green' : o === 'LOSS' ? 'red' : o === 'SCRATCH' ? 'yellow' : 'muted';
+    const wins   = entries.filter(e => e.outcome === 'WIN').length;
+    const losses = entries.filter(e => e.outcome === 'LOSS').length;
+    const totalPnl = entries.reduce((s, e) => s + (e.pnl || 0), 0);
+    const summaryHtml =
+      '<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;font-size:.72rem">'
+      + '<span>Total: <b>' + r.total + '</b></span>'
+      + '<span class="green">Wins: <b>' + wins + '</b></span>'
+      + '<span class="red">Losses: <b>' + losses + '</b></span>'
+      + '<span class="' + (totalPnl >= 0 ? 'green' : 'red') + '">Net P&L: <b>Rs.' + fmtN(totalPnl) + '</b></span>'
+      + '</div>';
+    const tableHtml = '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.7rem">'
+      + '<thead><tr style="color:var(--muted);border-bottom:1px solid var(--border)">'
+      + '<th style="text-align:left;padding:4px 6px">Time</th>'
+      + '<th style="text-align:left;padding:4px 6px">Symbol</th>'
+      + '<th style="padding:4px 6px">Dir</th>'
+      + '<th style="padding:4px 6px">Engine</th>'
+      + '<th style="padding:4px 6px">Conf</th>'
+      + '<th style="padding:4px 6px">Entry</th>'
+      + '<th style="padding:4px 6px">SL</th>'
+      + '<th style="padding:4px 6px">T2</th>'
+      + '<th style="padding:4px 6px">RR</th>'
+      + '<th style="padding:4px 6px">Outcome</th>'
+      + '<th style="padding:4px 6px">P&L</th>'
+      + '</tr></thead><tbody>'
+      + entries.map(e => {
+          const dc = e.direction === 'BUY' ? 'green' : 'red';
+          const entryMid = e.entry_low && e.entry_high ? ((e.entry_low + e.entry_high) / 2).toFixed(2) : '--';
+          return '<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="toggleOutcome(' + e.id + ',\'' + e.outcome + '\')">'
+            + '<td style="padding:4px 6px;color:var(--muted)">' + (e.ts || '').slice(0, 16) + '</td>'
+            + '<td style="padding:4px 6px;font-weight:700">' + e.symbol + '</td>'
+            + '<td style="padding:4px 6px;text-align:center"><span class="' + dc + '">' + e.direction + '</span></td>'
+            + '<td style="padding:4px 6px;text-align:center;color:var(--muted)">' + (e.engine || '--') + '</td>'
+            + '<td style="padding:4px 6px;text-align:center">' + (e.confidence ? e.confidence.toFixed(0) + '%' : '--') + '</td>'
+            + '<td style="padding:4px 6px;text-align:right">Rs.' + fmtN(entryMid) + '</td>'
+            + '<td style="padding:4px 6px;text-align:right;color:var(--red)">Rs.' + fmtN(e.sl) + '</td>'
+            + '<td style="padding:4px 6px;text-align:right;color:var(--green)">Rs.' + fmtN(e.t2) + '</td>'
+            + '<td style="padding:4px 6px;text-align:center">' + (e.rr_t2 || '--') + 'x</td>'
+            + '<td style="padding:4px 6px;text-align:center"><span class="' + outcomeColor(e.outcome) + '">' + (e.outcome || 'OPEN') + '</span></td>'
+            + '<td style="padding:4px 6px;text-align:right;color:' + (e.pnl >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (e.pnl ? 'Rs.' + fmtN(e.pnl) : '--') + '</td>'
+            + '</tr>';
+        }).join('')
+      + '</tbody></table></div>'
+      + '<div style="font-size:.65rem;color:var(--muted);margin-top:6px">Click any row to cycle outcome: OPEN → WIN → LOSS → SCRATCH</div>';
+    document.getElementById('journalBody').innerHTML = summaryHtml + tableHtml;
+  } catch(e) { document.getElementById('journalBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
+}
+
+async function toggleOutcome(id, current) {
+  const cycle = { OPEN: 'WIN', WIN: 'LOSS', LOSS: 'SCRATCH', SCRATCH: 'OPEN' };
+  const next = cycle[current] || 'WIN';
+  const pnl = next === 'WIN' ? 500 : next === 'LOSS' ? -300 : 0;  // placeholder; user can edit
+  try {
+    await fetch('/api/journal/' + id, { method: 'PATCH', headers: {'Content-Type':'application/json'}, body: JSON.stringify({outcome: next, pnl}) });
+    loadJournal();
+  } catch(e) {}
+}
+
+function exportJournal() {
+  window.open('/api/journal?limit=1000&offset=0', '_blank');
+}
+
+setTimeout(() => { selectSym('RELIANCE'); _startAutoRefresh(); }, 600);
 </script>
 </body></html>"""
 
+
+
+@app.get("/api/journal")
+async def get_journal(limit: int = 50, offset: int = 0):
+    """
+    Return the last `limit` signal entries from the SQLite trade journal.
+    The DB is written by the background signal-logger whenever a BUY/SELL
+    signal fires.  If the DB doesn't exist yet, returns an empty list so the
+    UI shows a sensible 'No entries yet' message rather than an error.
+    """
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        # Create table if it doesn't exist (first run)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT    NOT NULL,
+                symbol      TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,
+                engine      TEXT,
+                confidence  REAL,
+                entry_low   REAL,
+                entry_high  REAL,
+                sl          REAL,
+                t1          REAL,
+                t2          REAL,
+                t3          REAL,
+                rr_t2       REAL,
+                outcome     TEXT    DEFAULT 'OPEN',
+                pnl         REAL    DEFAULT 0,
+                notes       TEXT
+            )
+        """)
+        conn.commit()
+        rows = cur.execute(
+            "SELECT * FROM signal_log ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        total = cur.execute("SELECT COUNT(*) FROM signal_log").fetchone()[0]
+        conn.close()
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "entries": [dict(r) for r in rows],
+        }
+    except Exception as e:
+        log.error(f"Journal fetch error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.patch("/api/journal/{entry_id}")
+async def update_journal_entry(entry_id: int, request: Request):
+    """Update outcome/pnl for a journal entry (mark as WIN/LOSS/SCRATCH)."""
+    try:
+        body = await request.json()
+        outcome = body.get("outcome", "OPEN")
+        pnl     = float(body.get("pnl", 0))
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute(
+            "UPDATE signal_log SET outcome=?, pnl=? WHERE id=?",
+            (outcome, pnl, entry_id)
+        )
+        conn.commit(); conn.close()
+        return {"ok": True, "id": entry_id, "outcome": outcome, "pnl": pnl}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @app.get("/favicon.ico", include_in_schema=False)

@@ -9291,6 +9291,530 @@ async def ui():
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+#  SNIPER ENGINE  —  High-Accuracy Strategy (Less Noise, More Profit)
+#  ─────────────────────────────────────────────────────────────────────────────
+#  Rules (must ALL pass to fire a signal):
+#    1. TIME   : 09:30–11:30 IST  OR  14:30–15:30 IST  only
+#    2. TREND  : Price > EMA50 > EMA200 (BUY)  |  Price < EMA50 < EMA200 (SELL)
+#    3. PATTERN: ONLY Bullish / Bearish Engulfing on the second-to-last candle
+#    4. CONFIRM: Latest closed candle breaks pattern candle's High (BUY) / Low (SELL)
+#    5. LOCATION: Price within 0.8% of VWAP, PDL (BUY) or PDH (SELL)
+#    6. INDEX  : NIFTY 50 EMA50/200 trend must NOT oppose signal direction
+#    7. RR     : Stop Loss at pattern candle extreme. T2 must be ≥ 2× risk
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+def _sniper_ema(series: pd.Series, period: int) -> pd.Series:
+    """EMA using pandas ewm — same method as SMCEngine._calc_ema."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def _sniper_vwap(df: pd.DataFrame) -> Optional[float]:
+    """
+    Intraday VWAP from the day's candles only.
+    Falls back to whole-df VWAP if same-day filtering returns < 3 rows.
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(tz=IST).date()
+        ts_col = df["timestamp"]
+        # normalise timezone-aware timestamps
+        if hasattr(ts_col.iloc[0], "tzinfo") and ts_col.iloc[0].tzinfo:
+            today_mask = ts_col.dt.tz_convert(IST).dt.date == today
+        else:
+            today_mask = ts_col.dt.date == today
+        day_df = df[today_mask] if today_mask.sum() >= 3 else df
+        tp  = (day_df["high"] + day_df["low"] + day_df["close"]) / 3
+        vol = day_df["volume"].replace(0, np.nan).fillna(1)
+        return float((tp * vol).sum() / vol.sum())
+    except Exception:
+        return None
+
+
+def _sniper_time_ok() -> Tuple[bool, str]:
+    """
+    Returns (allowed, window_name).
+    Allowed windows: 09:30–11:30  or  14:30–15:30 IST.
+    Outside market hours we always allow (for paper/back-test mode).
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    if now.weekday() >= 5:                    # Saturday / Sunday
+        return False, "Weekend"
+    t = now.time()
+    import datetime as _dt
+    mkt_open  = _dt.time(9, 15)
+    mkt_close = _dt.time(15, 30)
+    if not (mkt_open <= t <= mkt_close):      # outside market — allow (pre/post)
+        return True, "off-hours"
+    w1_start, w1_end = _dt.time(9, 30), _dt.time(11, 30)
+    w2_start, w2_end = _dt.time(14, 30), _dt.time(15, 30)
+    if w1_start <= t <= w1_end:
+        return True, "Morning (09:30–11:30)"
+    if w2_start <= t <= w2_end:
+        return True, "Power Hour (14:30–15:30)"
+    return False, f"Dead zone {t.strftime('%H:%M')} — trade only 09:30-11:30 or 14:30-15:30"
+
+
+def _sniper_trend(df: pd.DataFrame, direction: str) -> Tuple[bool, str]:
+    """
+    EMA-50 / EMA-200 trend alignment check.
+    BUY  requires: close > EMA50 > EMA200
+    SELL requires: close < EMA50 < EMA200
+
+    If df has < 200 rows we use EMA50 vs EMA20 as a proxy — still meaningful.
+    Returns (ok, note).
+    """
+    try:
+        close = df["close"].astype(float)
+        e50   = float(_sniper_ema(close, 50).iloc[-1])
+        if len(close) >= 200:
+            e200 = float(_sniper_ema(close, 200).iloc[-1])
+            label = "EMA200"
+        else:
+            e200 = float(_sniper_ema(close, min(20, len(close) - 1)).iloc[-1])
+            label = "EMA20(proxy)"
+        price = float(close.iloc[-1])
+        if direction == "BUY":
+            ok = price > e50 > e200
+            note = f"price {price:.0f} {'>' if price>e50 else '<'} EMA50 {e50:.0f} {'>' if e50>e200 else '<'} {label} {e200:.0f}"
+        else:
+            ok = price < e50 < e200
+            note = f"price {price:.0f} {'<' if price<e50 else '>'} EMA50 {e50:.0f} {'<' if e50<e200 else '>'} {label} {e200:.0f}"
+        return ok, note
+    except Exception as exc:
+        return True, f"trend check skipped ({exc})"   # soft fail — don't block
+
+
+def _sniper_location(
+    df: pd.DataFrame,
+    inst: "InstitutionalLevels",
+    direction: str,
+    price: float,
+    tolerance: float = 0.008,
+) -> Tuple[bool, str]:
+    """
+    Location filter — only trade at a meaningful level:
+      BUY  : within tolerance% of VWAP  OR  PDL
+      SELL : within tolerance% of VWAP  OR  PDH
+
+    If no PDH/PDL available (index or missing), we relax to VWAP-only.
+    """
+    vwap = _sniper_vwap(df)
+    pdh  = getattr(inst, "pdh", None)
+    pdl  = getattr(inst, "pdl", None)
+
+    def near(ref: Optional[float]) -> bool:
+        if ref is None or ref <= 0:
+            return False
+        return abs(price - ref) / ref <= tolerance
+
+    hits: List[str] = []
+    if near(vwap):
+        hits.append(f"VWAP {vwap:.0f}")
+    if direction == "BUY" and near(pdl):
+        hits.append(f"PDL {pdl:.0f}")
+    if direction == "SELL" and near(pdh):
+        hits.append(f"PDH {pdh:.0f}")
+
+    # Always allow if we have no institutional levels (e.g. index symbols)
+    if pdh is None and pdl is None:
+        return True, "no inst levels — location skipped"
+
+    if hits:
+        return True, "At " + " / ".join(hits)
+    level_str = f"PDL {pdl:.0f}" if direction == "BUY" and pdl else (f"PDH {pdh:.0f}" if pdh else "")
+    return False, f"Price {price:.0f} not near VWAP {vwap:.0f if vwap else 'N/A'} or {level_str}"
+
+
+def _sniper_find_engulfing(df: pd.DataFrame) -> Optional[Dict]:
+    """
+    Scan the last 5 candles for the most recent Engulfing pattern.
+    Returns a dict with keys: direction, pattern_idx, pattern_candle, prev_candle
+    or None if nothing found.
+
+    We deliberately look at candles that are CONFIRMED (i.e. not the live
+    in-progress candle at iloc[-1]). The live candle is used for confirmation.
+    """
+    # Work backwards over positions [-2, -3, -4, -5] (skip live candle)
+    for offset in range(2, 6):
+        if offset >= len(df):
+            break
+        i     = len(df) - offset           # pattern candle index
+        curr  = df.iloc[i]
+        prev  = df.iloc[i - 1]
+
+        curr_open  = float(curr["open"])
+        curr_close = float(curr["close"])
+        prev_open  = float(prev["open"])
+        prev_close = float(prev["close"])
+        curr_body  = abs(curr_close - curr_open)
+        prev_body  = abs(prev_close - prev_open)
+
+        if prev_body < 1e-8:               # avoid division by zero
+            continue
+
+        # Bullish Engulfing
+        if (prev_close < prev_open          # prev bearish
+                and curr_close > curr_open  # curr bullish
+                and curr_open  < prev_close # opens below prev close
+                and curr_close > prev_open  # closes above prev open
+                and curr_body  > prev_body * 1.0):  # body must engulf
+            engulf_ratio = round(curr_body / prev_body, 2)
+            return {
+                "direction":      "BUY",
+                "pattern":        "Bullish Engulfing",
+                "pattern_idx":    i,
+                "engulf_ratio":   engulf_ratio,
+                "pattern_high":   float(curr["high"]),
+                "pattern_low":    float(curr["low"]),
+                "pattern_open":   curr_open,
+                "pattern_close":  curr_close,
+                "prev_open":      prev_open,
+                "prev_close":     prev_close,
+            }
+
+        # Bearish Engulfing
+        if (prev_close > prev_open          # prev bullish
+                and curr_close < curr_open  # curr bearish
+                and curr_open  > prev_close # opens above prev close
+                and curr_close < prev_open  # closes below prev open
+                and curr_body  > prev_body * 1.0):
+            engulf_ratio = round(curr_body / prev_body, 2)
+            return {
+                "direction":      "SELL",
+                "pattern":        "Bearish Engulfing",
+                "pattern_idx":    i,
+                "engulf_ratio":   engulf_ratio,
+                "pattern_high":   float(curr["high"]),
+                "pattern_low":    float(curr["low"]),
+                "pattern_open":   curr_open,
+                "pattern_close":  curr_close,
+                "prev_open":      prev_open,
+                "prev_close":     prev_close,
+            }
+
+    return None
+
+
+def _sniper_confirmation(df: pd.DataFrame, eng: Dict) -> Tuple[bool, str]:
+    """
+    Confirmation: the candle AFTER the pattern candle must break the
+    pattern candle's extreme in the signal direction.
+
+    BUY  — latest candle's close > pattern candle's high
+    SELL — latest candle's close < pattern candle's low
+
+    If the pattern candle is NOT second-to-last yet (older), we check
+    the candle immediately following the pattern candle.
+    """
+    pattern_idx  = eng["pattern_idx"]
+    direction    = eng["direction"]
+    next_idx     = pattern_idx + 1
+
+    if next_idx >= len(df):
+        return False, "No candle after pattern yet — wait"
+
+    confirm_candle = df.iloc[next_idx]
+    conf_close     = float(confirm_candle["close"])
+    conf_high      = float(confirm_candle["high"])
+    conf_low       = float(confirm_candle["low"])
+
+    if direction == "BUY":
+        triggered = conf_close > eng["pattern_high"]
+        note = (
+            f"Confirmation candle close {conf_close:.2f} "
+            f"{'>' if triggered else '<='} pattern high {eng['pattern_high']:.2f}"
+        )
+        return triggered, note
+    else:
+        triggered = conf_close < eng["pattern_low"]
+        note = (
+            f"Confirmation candle close {conf_close:.2f} "
+            f"{'<' if triggered else '>='} pattern low {eng['pattern_low']:.2f}"
+        )
+        return triggered, note
+
+
+_sniper_nifty_cache: Dict = {}   # {"ts": datetime, "trend": "BUY"|"SELL"|"NEUTRAL"}
+
+def _sniper_nifty_trend() -> str:
+    """
+    Returns NIFTY 50 short-term trend: "BUY", "SELL", or "NEUTRAL".
+    Caches result for 10 minutes to avoid hammering Kite API.
+    """
+    global _sniper_nifty_cache
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    cached = _sniper_nifty_cache
+    if cached and (now - cached.get("ts", now)).seconds < 600:
+        return cached.get("trend", "NEUTRAL")
+
+    try:
+        token = get_instrument_token("NIFTY 50")
+        if token is None:
+            return "NEUTRAL"
+        with _kite_semaphore:
+            ndf = kite_manager.get_historical_data(token, "15minute", 10)
+        if ndf.empty or len(ndf) < 20:
+            return "NEUTRAL"
+        close = ndf["close"].astype(float)
+        e50   = float(_sniper_ema(close, 50).iloc[-1])
+        e20   = float(_sniper_ema(close, 20).iloc[-1])   # use 20 as proxy for 200 on short df
+        price = float(close.iloc[-1])
+        if price > e50 > e20:
+            trend = "BUY"
+        elif price < e50 < e20:
+            trend = "SELL"
+        else:
+            trend = "NEUTRAL"
+        _sniper_nifty_cache = {"ts": now, "trend": trend}
+        return trend
+    except Exception:
+        return "NEUTRAL"
+
+
+# ── Main Sniper Signal Function ───────────────────────────────────────────────
+
+def _compute_sniper_signal(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    The Sniper Engine — 7-gate high-accuracy signal.
+    Returns a dict with signal = BUY | SELL | WAIT plus full context.
+    All 7 gates must pass; each failed gate returns WAIT with reason.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+
+    def _wait(reason: str, **extra) -> Dict:
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": reason, "fetched_at": now_ist.strftime("%H:%M:%S IST"), **extra}
+
+    # ── Gate 1: Time window ───────────────────────────────────────────────────
+    time_ok, time_note = _sniper_time_ok()
+    if not time_ok:
+        return _wait(f"⏰ {time_note}")
+
+    # ── Fetch candles ─────────────────────────────────────────────────────────
+    token = get_instrument_token(symbol)
+    if token is None:
+        return _wait(f"Unknown symbol: {symbol}")
+
+    with _kite_semaphore:
+        df = kite_manager.get_historical_data(token, interval, 15)
+    if df.empty or len(df) < 30:
+        with _kite_semaphore:
+            df = kite_manager.get_historical_data(token, interval, 20)
+    if df.empty or len(df) < 20:
+        return _wait("Insufficient candle data from Kite")
+
+    price = float(df["close"].iloc[-1])
+    inst  = calculate_institutional_levels(df, symbol)
+
+    # ── Gate 2: Engulfing pattern ─────────────────────────────────────────────
+    eng = _sniper_find_engulfing(df)
+    if eng is None:
+        return _wait("No Bullish/Bearish Engulfing in last 5 candles")
+
+    direction = eng["direction"]
+
+    # ── Gate 3: Trend alignment ───────────────────────────────────────────────
+    trend_ok, trend_note = _sniper_trend(df, direction)
+    if not trend_ok:
+        return _wait(f"📉 Trend misaligned — {trend_note}")
+
+    # ── Gate 4: Confirmation candle ───────────────────────────────────────────
+    conf_ok, conf_note = _sniper_confirmation(df, eng)
+    if not conf_ok:
+        return _wait(f"⏳ Awaiting confirmation — {conf_note}")
+
+    # ── Gate 5: Location (VWAP / PDH / PDL) ──────────────────────────────────
+    loc_ok, loc_note = _sniper_location(df, inst, direction, price)
+    if not loc_ok:
+        return _wait(f"📍 Location filter failed — {loc_note}")
+
+    # ── Gate 6: NIFTY index trend must not oppose signal ──────────────────────
+    nifty_trend = _sniper_nifty_trend()
+    if nifty_trend != "NEUTRAL" and nifty_trend != direction:
+        return _wait(
+            f"🏦 NIFTY trend ({nifty_trend}) opposes {direction} signal — skip",
+            nifty_trend=nifty_trend,
+        )
+
+    # ── Gate 7: Risk-Reward ≥ 2:1 ────────────────────────────────────────────
+    if direction == "BUY":
+        sl     = round(eng["pattern_low"]  - (eng["pattern_high"] - eng["pattern_low"]) * 0.1, 2)
+        entry  = round(eng["pattern_high"] * 1.001, 2)          # just above confirmation break
+    else:
+        sl     = round(eng["pattern_high"] + (eng["pattern_high"] - eng["pattern_low"]) * 0.1, 2)
+        entry  = round(eng["pattern_low"]  * 0.999, 2)
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return _wait("Zero risk — price levels collapsed")
+
+    # SL sanity check (reuse existing guard logic)
+    if direction == "BUY" and sl >= entry:
+        sl = round(entry - risk, 2)
+    if direction == "SELL" and sl <= entry:
+        sl = round(entry + risk, 2)
+
+    t1 = round(entry + risk * 1.0, 2) if direction == "BUY" else round(entry - risk * 1.0, 2)
+    t2 = round(entry + risk * 2.0, 2) if direction == "BUY" else round(entry - risk * 2.0, 2)
+    t3 = round(entry + risk * 3.0, 2) if direction == "BUY" else round(entry - risk * 3.0, 2)
+    rr = round(abs(t2 - entry) / risk, 2)
+
+    if rr < 2.0:
+        return _wait(f"📊 RR {rr}x below minimum 2x — skip trade")
+
+    # ── All gates passed — fire signal ───────────────────────────────────────
+    confidence = 70.0
+
+    # Bonus: volume on pattern candle
+    try:
+        pat_vol  = float(df.iloc[eng["pattern_idx"]]["volume"])
+        avg_vol  = float(df["volume"].rolling(20).mean().iloc[eng["pattern_idx"]])
+        vol_mult = pat_vol / avg_vol if avg_vol > 0 else 1.0
+        if vol_mult >= 1.5:
+            confidence += 8
+        elif vol_mult >= 1.2:
+            confidence += 4
+    except Exception:
+        vol_mult = 1.0
+
+    # Bonus: engulf ratio
+    if eng["engulf_ratio"] >= 2.0:
+        confidence += 7
+    elif eng["engulf_ratio"] >= 1.5:
+        confidence += 4
+
+    # Penalty: pattern is older (not second-to-last candle)
+    candles_ago = len(df) - 1 - eng["pattern_idx"]
+    if candles_ago > 2:
+        confidence -= (candles_ago - 2) * 5
+
+    confidence = round(min(95.0, max(50.0, confidence)), 1)
+
+    reasons = [
+        f"Pattern: {eng['pattern']} ({eng['engulf_ratio']}x engulf)",
+        f"Confirmed: {conf_note}",
+        f"Trend: {trend_note}",
+        f"{loc_note}",
+    ]
+    if nifty_trend != "NEUTRAL":
+        reasons.append(f"NIFTY aligned: {nifty_trend}")
+
+    # Log to journal
+    try:
+        threading.Thread(
+            target=_log_signal,
+            args=(symbol, direction, "sniper", confidence, entry * 0.999, entry * 1.001,
+                  sl, t2, rr, " | ".join(reasons[:3])),
+            daemon=True,
+        ).start()
+    except Exception:
+        pass
+
+    return {
+        "symbol":        symbol,
+        "signal":        direction,
+        "engine":        "sniper",
+        "confidence":    confidence,
+        "quality":       "A+" if confidence >= 78 else "A",
+        "pattern":       eng["pattern"],
+        "engulf_ratio":  eng["engulf_ratio"],
+        "entry":         entry,
+        "sl":            sl,
+        "t1":            t1,
+        "t2":            t2,
+        "t3":            t3,
+        "rr_t2":         rr,
+        "current_price": price,
+        "time_window":   time_note,
+        "trend_note":    trend_note,
+        "location":      loc_note,
+        "nifty_trend":   nifty_trend,
+        "vol_mult":      round(vol_mult, 2),
+        "reasons":       reasons,
+        "warnings":      [],
+        "fetched_at":    now_ist.strftime("%H:%M:%S IST"),
+    }
+
+
+# ── FastAPI Endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/api/sniper/{symbol}")
+async def sniper_signal(symbol: str, interval: str = "15minute"):
+    """
+    High-accuracy Sniper signal for a single symbol.
+    All 7 gates (time, trend, engulfing, confirmation, location, index, RR) must pass.
+    Returns WAIT with reason if any gate fails.
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, lambda: _compute_sniper_signal(symbol, interval)
+        )
+        return result
+    except Exception as e:
+        log.error(f"Sniper signal error {symbol}: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/sniper-scan")
+async def sniper_scan(limit: int = 20, interval: str = "15minute"):
+    """
+    Scan the liquid universe through the Sniper Engine.
+    Only returns confirmed BUY/SELL signals where all 7 gates pass.
+    Typically fires 1–4 signals per session (by design — quality over quantity).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+
+    scan_list = [
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "BAJFINANCE",
+        "TATAMOTORS", "AXISBANK", "SBIN", "WIPRO", "HCLTECH",
+        "TATASTEEL", "VEDL", "COALINDIA", "ONGC", "SAIL", "NATIONALUM",
+        "MARUTI", "BAJAJ-AUTO", "TITAN", "SUNPHARMA",
+        "DRREDDY", "RVNL", "ADANIENT", "LTIM", "KPITTECH",
+    ][:limit + 10]
+
+    results: List[Dict] = []
+    wait_reasons: List[Dict] = []
+
+    def _scan_one(sym: str):
+        try:
+            return _compute_sniper_signal(sym, interval)
+        except Exception as exc:
+            return {"symbol": sym, "signal": "WAIT", "reason": str(exc), "engine": "sniper"}
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_scan_one, s): s for s in scan_list}
+        for f in as_completed(futs, timeout=90):
+            r = f.result()
+            if r and r.get("signal") in ("BUY", "SELL"):
+                results.append(r)
+            elif r:
+                wait_reasons.append({"symbol": r.get("symbol"), "reason": r.get("reason", "WAIT")})
+
+    results.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    time_ok, time_note = _sniper_time_ok()
+
+    return {
+        "scanned":        len(scan_list),
+        "signals_found":  len(results),
+        "signals":        results[:limit],
+        "time_window_ok": time_ok,
+        "time_note":      time_note,
+        "wait_summary":   wait_reasons[:10],
+        "fetched_at":     datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ════════════════════════════════════════════════════════════════════════════════
 

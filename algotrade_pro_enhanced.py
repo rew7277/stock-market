@@ -7869,7 +7869,7 @@ function renderSignalCard(r) {
     : `Wait for price to reach ₹${fmtN(r.entry_low)} – ₹${fmtN(r.entry_high)}`;
 
   const warns = (r.warnings || []).map(w =>
-    `<div style="font-size:.7rem;color:var(--yellow);padding:2px 0">⚠ ${w}</div>`).join('');
+    `<div style="font-size:.7rem;color:var(--yellow);padding:2px 0">&#x26A0; ${w}</div>`).join('');
 
   const reasons = (r.reasons || []).map(rs =>
     `<div style="font-size:.71rem;color:var(--sub);padding:2px 0;border-bottom:1px solid var(--border)">${rs}</div>`).join('');
@@ -7993,7 +7993,7 @@ function renderTargets(t1, t2, t3, t4, entry, sl, rr2, rr3, dir, labelMode) {
   // a misleading target grid — show a waiting message instead.
   if (!rr2 || rr2 === 0 || Math.abs(t1 - entry) < 0.01) {
     return `<div style="padding:8px;font-size:.73rem;color:var(--muted);background:var(--panel2);border-radius:5px;margin-top:7px">
-      ⏳ No active setup — waiting for entry conditions to align.
+      &#x23F3; No active setup — waiting for entry conditions to align.
     </div>`;
   }
   // ORB uses range multiples, not Fib extensions — show correct labels
@@ -8332,7 +8332,7 @@ async function loadOrb() {
     // FIX: show invalidation banner when CMP has breached the ORB signal level
     const invalidBanner = s.invalidated
       ? '<div style="background:#3a1010;border:1px solid var(--red);border-radius:5px;padding:7px;margin:7px 0;font-size:.73rem;color:var(--red)">'
-        + '⛔ <b>Signal Invalidated</b> — price has reclaimed the ORB boundary. Do not enter.'
+        + '&#x26D4; <b>Signal Invalidated</b> — price has reclaimed the ORB boundary. Do not enter.'
         + '</div>'
       : '';
     document.getElementById('orbBody').innerHTML = '<div class="signal-box ' + (s.direction==='BULL'?'BUY':'SELL') + '">'
@@ -8403,11 +8403,11 @@ async function loadFno() {
     const pcrPanel = r.market_bias ? (
       '<div class="card" style="margin-bottom:8px;padding:8px 10px">'
       + '<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;font-size:.75rem">'
-      + '<span>🧭 Bias: <b class="' + biasColor + '">' + r.market_bias + '</b></span>'
-      + (r.range_support ? '<span>🟢 Support: <b>' + fmtN(r.range_support) + '</b></span>' : '')
-      + (r.range_resistance ? '<span>🔴 Resistance: <b>' + fmtN(r.range_resistance) + '</b></span>' : '')
+      + '<span>&#x1F9ED; Bias: <b class="' + biasColor + '">' + r.market_bias + '</b></span>'
+      + (r.range_support ? '<span>&#x1F7E2; Support: <b>' + fmtN(r.range_support) + '</b></span>' : '')
+      + (r.range_resistance ? '<span>&#x1F534; Resistance: <b>' + fmtN(r.range_resistance) + '</b></span>' : '')
       + (r.range_pts ? '<span>↔ Range: <b>' + fmtN(r.range_pts) + ' pts</b></span>' : '')
-      + (r.iv_proxy ? '<span>📊 IV Proxy: <b>' + r.iv_proxy + '%</b></span>' : '')
+      + (r.iv_proxy ? '<span>&#x1F4CA; IV Proxy: <b>' + r.iv_proxy + '%</b></span>' : '')
       + '</div>'
       + '<div style="font-size:.68rem;color:var(--muted);margin-top:4px">' + (r.bias_reason || '') + '</div>'
       + '</div>'
@@ -8432,7 +8432,7 @@ async function loadFno() {
         + '<div style="font-size:.7rem;color:var(--muted);margin-bottom:4px">Expiry: ' + s.expiry_str + ' (' + s.expiry_type + ') | Lot: ' + s.lot_size + '</div>'
         + '<div class="scan-targets"><span class="scan-t">LTP: <b>Rs.' + fmtN(s.option_price) + '</b></span><span class="scan-t">SL: <b class="red">Rs.' + fmtN(s.option_sl) + '</b></span><span class="scan-t">T: <b class="green">Rs.' + fmtN(s.option_target) + '</b></span><span class="scan-t">RR: <b>' + s.rr + '</b></span></div>'
         + '<div style="font-size:.68rem;margin-top:5px;display:flex;gap:12px;flex-wrap:wrap">'
-        + '<span>💰 Capital needed: <b class="yellow">' + capitalNeeded + '</b></span>'
+        + '<span>&#x1F4B0; Capital needed: <b class="yellow">' + capitalNeeded + '</b></span>'
         + '<span>[!] Max loss/lot: <b class="red">' + maxLoss + '</b></span>'
         + '</div>'
         + '</div>';
@@ -8526,10 +8526,10 @@ async function loadSniperDailyBar() {
     document.getElementById('sdTimeNote').textContent = r.time_note   ?? '';
     const statusEl = document.getElementById('sdStatus');
     if (!r.trading_allowed) {
-      statusEl.textContent = '🚫 ' + (r.block_reason || 'Trading paused');
+      statusEl.textContent = '&#x1F6AB; ' + (r.block_reason || 'Trading paused');
       statusEl.className = 'red';
     } else {
-      statusEl.textContent = '✅ Trading allowed';
+      statusEl.textContent = '&#x2705; Trading allowed';
       statusEl.className = 'green';
     }
   } catch(e) {}
@@ -8537,7 +8537,7 @@ async function loadSniperDailyBar() {
 
 async function runSniperScan() {
   const body = document.getElementById('sniperBody');
-  body.innerHTML = '<p class="muted" style="font-size:.78rem;padding:10px">⚡ Scanning 26 liquid stocks through 7 gates... (~30 sec)</p>';
+  body.innerHTML = '<p class="muted" style="font-size:.78rem;padding:10px">&#x26A1; Scanning 26 liquid stocks through 7 gates... (~30 sec)</p>';
   await loadSniperDailyBar();
   const interval = document.getElementById('sniperInterval').value;
   try {
@@ -8554,7 +8554,7 @@ async function runSniperScan() {
 
     if (!r.signals || !r.signals.length) {
       html += '<div style="text-align:center;padding:30px;color:var(--muted);font-size:.8rem">'
-        + '🎯 No sniper setups right now — all ' + r.scanned + ' stocks checked.<br>'
+        + '&#x1F3AF; No sniper setups right now — all ' + r.scanned + ' stocks checked.<br>'
         + '<span style="font-size:.68rem">This is normal. Sniper fires 1-4 times per session.<br>Top wait reasons:</span><br>'
         + (r.wait_summary||[]).slice(0,5).map(w =>
             '<span style="font-size:.65rem;color:var(--muted)">• ' + w.symbol + ': ' + (w.reason||'').split('—')[0].trim() + '</span>'
@@ -8609,11 +8609,11 @@ function renderSniperCard(s) {
     <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
       <button onclick="executeSniper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
         style="background:${sigColor}22;border:1px solid ${sigColor};color:${sigColor};padding:5px 14px;border-radius:5px;cursor:pointer;font-weight:700;font-size:.75rem">
-        🚀 Execute Trade
+        &#x1F680; Execute Trade
       </button>
       <button onclick="executeSniperPaper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
         style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:.72rem">
-        📋 Paper Log
+        &#x1F4CB; Paper Log
       </button>
       <span style="font-size:.65rem;color:var(--muted);margin-left:4px">MIS · NSE · LIMIT</span>
     </div>
@@ -8640,15 +8640,15 @@ async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
     }).then(x => x.json());
 
     if (res.error) {
-      btn.textContent = '❌ ' + res.error;
+      btn.textContent = '&#x274C; ' + res.error;
       btn.style.color = '#ff4444';
     } else {
-      btn.textContent = '✅ Order placed #' + res.entry_order_id;
+      btn.textContent = '&#x2705; Order placed #' + res.entry_order_id;
       btn.style.color = '#00ff88';
       await loadSniperDailyBar();
     }
   } catch(e) {
-    btn.textContent = '❌ ' + e.message;
+    btn.textContent = '&#x274C; ' + e.message;
     btn.style.color = '#ff4444';
   }
 }
@@ -8662,9 +8662,9 @@ async function executeSniperPaper(btn, symbol, direction, entry, sl, t1, t2) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({symbol, direction, entry, sl, t1, t2})
     }).then(x => x.json());
-    btn.textContent = res.ok ? '✅ Logged' : '❌ ' + res.error;
+    btn.textContent = res.ok ? '&#x2705; Logged' : '&#x274C; ' + res.error;
   } catch(e) {
-    btn.textContent = '❌ ' + e.message;
+    btn.textContent = '&#x274C; ' + e.message;
   }
 }
 

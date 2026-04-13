@@ -8406,7 +8406,7 @@ async function loadFno() {
       + '<span>🧭 Bias: <b class="' + biasColor + '">' + r.market_bias + '</b></span>'
       + (r.range_support ? '<span>🟢 Support: <b>' + fmtN(r.range_support) + '</b></span>' : '')
       + (r.range_resistance ? '<span>🔴 Resistance: <b>' + fmtN(r.range_resistance) + '</b></span>' : '')
-      + (r.range_pts ? '<span>↔️ Range: <b>' + fmtN(r.range_pts) + ' pts</b></span>' : '')
+      + (r.range_pts ? '<span>↔ Range: <b>' + fmtN(r.range_pts) + ' pts</b></span>' : '')
       + (r.iv_proxy ? '<span>📊 IV Proxy: <b>' + r.iv_proxy + '%</b></span>' : '')
       + '</div>'
       + '<div style="font-size:.68rem;color:var(--muted);margin-top:4px">' + (r.bias_reason || '') + '</div>'
@@ -8433,7 +8433,7 @@ async function loadFno() {
         + '<div class="scan-targets"><span class="scan-t">LTP: <b>Rs.' + fmtN(s.option_price) + '</b></span><span class="scan-t">SL: <b class="red">Rs.' + fmtN(s.option_sl) + '</b></span><span class="scan-t">T: <b class="green">Rs.' + fmtN(s.option_target) + '</b></span><span class="scan-t">RR: <b>' + s.rr + '</b></span></div>'
         + '<div style="font-size:.68rem;margin-top:5px;display:flex;gap:12px;flex-wrap:wrap">'
         + '<span>💰 Capital needed: <b class="yellow">' + capitalNeeded + '</b></span>'
-        + '<span>⚠️ Max loss/lot: <b class="red">' + maxLoss + '</b></span>'
+        + '<span>[!] Max loss/lot: <b class="red">' + maxLoss + '</b></span>'
         + '</div>'
         + '</div>';
     }).join('');
@@ -8622,7 +8622,7 @@ function renderSniperCard(s) {
 
 async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
   if (!confirm(
-    '⚠️ LIVE ORDER — Zerodha Kite\n\n' +
+    '[LIVE ORDER] Zerodha Kite\n\n' +
     direction + ' ' + symbol + '\n' +
     'Entry: ₹' + fmtN(entry) + '\n' +
     'SL: ₹' + fmtN(sl) + '\n' +
@@ -8631,7 +8631,7 @@ async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
   )) return;
 
   btn.disabled = true;
-  btn.textContent = '⏳ Placing...';
+  btn.textContent = '⌛ Placing...';
   try {
     const res = await fetch('/api/sniper/execute', {
       method: 'POST',
@@ -8655,7 +8655,7 @@ async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
 
 async function executeSniperPaper(btn, symbol, direction, entry, sl, t1, t2) {
   btn.disabled = true;
-  btn.textContent = '⏳ Logging...';
+  btn.textContent = '⌛ Logging...';
   try {
     const res = await fetch('/api/sniper/paper', {
       method: 'POST',
@@ -9193,7 +9193,7 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             t2         = round(_em_sig + _risk_fix * 1.272, 2)
             t3         = round(_em_sig + _risk_fix * 1.618, 2)
             t4         = round(_em_sig + _risk_fix * 2.0,   2)
-            reasons.append("ℹ️ Levels recomputed (SL was inverted for BUY)")
+            reasons.append("[i] Levels recomputed (SL was inverted for BUY)")
         elif final_dir == "SELL" and sl <= entry_high:
             # SL is below or at entry for a SELL — inverted, recompute
             sl         = round(_em_sig + _atr_sig * 1.5, 2)
@@ -9202,7 +9202,7 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             t2         = round(_em_sig - _risk_fix * 1.272, 2)
             t3         = round(_em_sig - _risk_fix * 1.618, 2)
             t4         = round(_em_sig - _risk_fix * 2.0,   2)
-            reasons.append("ℹ️ Levels recomputed (SL was inverted for SELL)")
+            reasons.append("[i] Levels recomputed (SL was inverted for SELL)")
 
     # Pattern boost
     if top_pattern and pat_dir == final_dir:
@@ -9477,7 +9477,7 @@ async def favicon():
 @app.get("/", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 async def ui():
-    return HTML_UI
+    return HTMLResponse(content=HTML_UI, media_type="text/html; charset=utf-8")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

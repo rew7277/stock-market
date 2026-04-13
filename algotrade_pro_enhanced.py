@@ -3592,8 +3592,7 @@ class SMCEngine:
         _IST_TZ = timezone(timedelta(hours=5, minutes=30))
         now = datetime.now(tz=_IST_TZ)  # Always IST regardless of server timezone
         h, m = now.hour, now.minute
-        # Also block weekends
-        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+        if now.weekday() >= 5:
             return "PRE", False, "⏳ Market closed — weekend."
         for (sh, sm), (eh, em), name, tradeable, note in self.SESSIONS:
             if (h, m) >= (sh, sm) and (h, m) < (eh, em):
@@ -3956,12 +3955,7 @@ class SMCEngine:
         if not session_tradeable:
             notes.append("⚠️ Session filter: not a tradeable window")
             _atr_est = atr if atr > 0 else curr * 0.005
-            _sl_def  = round(curr - _atr_est * 1.5, 2)
-            _t1_def  = round(curr + _atr_est * 1.0, 2)
-            _t2_def  = round(curr + _atr_est * 2.0, 2)
-            _t3_def  = round(curr + _atr_est * 3.0, 2)
-            _t4_def  = round(curr + _atr_est * 4.0, 2)
-            return "WAIT", 0.0, (round(curr - _atr_est*0.2, 2), round(curr + _atr_est*0.2, 2)), _sl_def, _t1_def, _t2_def, _t3_def, _t4_def, notes
+            return "WAIT", 0.0, (round(curr-_atr_est*0.2,2), round(curr+_atr_est*0.2,2)), round(curr-_atr_est*1.5,2), round(curr+_atr_est*1.0,2), round(curr+_atr_est*2.0,2), round(curr+_atr_est*3.0,2), round(curr+_atr_est*4.0,2), notes
 
         # Find nearest OB to price
         bull_ob_active = next((o for o in obs
@@ -8922,13 +8916,9 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             engine_votes[eng] = d
 
     # ── Confluence rule: 2+ engines must agree ────────────────────────────────
-    # Block any signal if session is not tradeable (SMC says so)
+    # Block any signal if session is not tradeable
     _session_ok = not smc_res or getattr(smc_res, "session_tradeable", True)
-    if votes["BUY"] >= 2:
-        final_dir = "BUY"
-    elif votes["SELL"] >= 2:
-        final_dir = "SELL"
-    elif not _session_ok:
+    if not _session_ok:
         _snote = getattr(smc_res, "session_note", "Session not tradeable")
         return {
             "symbol": symbol, "signal": "WAIT", "current_price": current_price,
@@ -8936,12 +8926,19 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             "engines": engine_votes, "data_age_min": data_age_min,
             "fetched_at": now_ist.strftime("%H:%M:%S IST"),
         }
+    if votes["BUY"] >= 2:
+        final_dir = "BUY"
+    elif votes["SELL"] >= 2:
+        final_dir = "SELL"
     else:
-        # Try VWAP tiebreak when exactly 1 engine signals
+        # VWAP tiebreak only when EXACTLY 1 engine signals AND it is NOT the Pattern engine alone
+        # (Pattern-only tiebreak produces unreliable signals with inverted levels)
         vwap_tb = getattr(smc_res, "vwap", None)
-        if vwap_tb and votes["BUY"] == 1 and current_price > vwap_tb * 1.002:
+        _non_pat_votes_buy  = sum(1 for e,d in engine_votes.items() if d=="BUY"  and e!="PATTERN")
+        _non_pat_votes_sell = sum(1 for e,d in engine_votes.items() if d=="SELL" and e!="PATTERN")
+        if vwap_tb and _non_pat_votes_buy >= 1 and votes["BUY"] == 1 and current_price > vwap_tb * 1.003:
             final_dir = "BUY"
-        elif vwap_tb and votes["SELL"] == 1 and current_price < vwap_tb * 0.998:
+        elif vwap_tb and _non_pat_votes_sell >= 1 and votes["SELL"] == 1 and current_price < vwap_tb * 0.997:
             final_dir = "SELL"
         else:
             return {
@@ -8991,6 +8988,31 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             t2 = round(em - risk * 1.272, 2)
             t3 = round(em - risk * 1.618, 2)
             t4 = round(em - risk * 2.0,   2)
+
+    # ── Sanity-check levels: SL must be on the correct side of entry ──────────
+    # If ICT/SMC returned a SHORT setup but signal is BUY (or vice versa),
+    # the stop loss will be on the wrong side. Recompute from ATR in that case.
+    if entry_low and entry_high and sl and t1:
+        _atr_sig = float((df["high"] - df["low"]).rolling(14).mean().dropna().iloc[-1]) if len(df) >= 14 else current_price * 0.005
+        _em_sig  = (entry_low + entry_high) / 2
+        if final_dir == "BUY" and sl >= entry_low:
+            # SL is above or at entry for a BUY — inverted, recompute
+            sl         = round(_em_sig - _atr_sig * 1.5, 2)
+            _risk_fix  = abs(_em_sig - sl)
+            t1         = round(_em_sig + _risk_fix * 1.0,   2)
+            t2         = round(_em_sig + _risk_fix * 1.272, 2)
+            t3         = round(_em_sig + _risk_fix * 1.618, 2)
+            t4         = round(_em_sig + _risk_fix * 2.0,   2)
+            reasons.append("ℹ️ Levels recomputed (SL was inverted for BUY)")
+        elif final_dir == "SELL" and sl <= entry_high:
+            # SL is below or at entry for a SELL — inverted, recompute
+            sl         = round(_em_sig + _atr_sig * 1.5, 2)
+            _risk_fix  = abs(sl - _em_sig)
+            t1         = round(_em_sig - _risk_fix * 1.0,   2)
+            t2         = round(_em_sig - _risk_fix * 1.272, 2)
+            t3         = round(_em_sig - _risk_fix * 1.618, 2)
+            t4         = round(_em_sig - _risk_fix * 2.0,   2)
+            reasons.append("ℹ️ Levels recomputed (SL was inverted for SELL)")
 
     # Pattern boost
     if top_pattern and pat_dir == final_dir:

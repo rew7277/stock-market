@@ -7721,7 +7721,11 @@ async function loadSignal() {
   loading('sigBody');
   try {
     const r = await fetch(`/api/signal/${encodeURIComponent(sym)}?interval=${interval}`).then(x => x.json());
-    document.getElementById('sigAge').textContent = r.fetched_at ? `Data: ${r.fetched_at}` : '';
+    const age = r.data_age_min || 0;
+    const ageStr = age > 60
+      ? `<span style="color:var(--red);font-weight:700">Data ${Math.round(age)} min old — STALE</span>`
+      : r.fetched_at ? `<span style="color:var(--muted)">Data: ${r.fetched_at} (${Math.round(age)} min ago)</span>` : '';
+    document.getElementById('sigAge').innerHTML = ageStr;
     document.getElementById('sigBody').innerHTML = renderSignalCard(r);
   } catch(e) {
     document.getElementById('sigBody').innerHTML = `<p class="red" style="font-size:.78rem">Error: ${e.message}</p>`;
@@ -8557,14 +8561,31 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
 
     current_price = float(df["close"].iloc[-1])
 
-    # Data freshness
+    # ── Data freshness check ─────────────────────────────────────────────────
     try:
         lct = df["timestamp"].iloc[-1]
-        lct_naive = lct.replace(tzinfo=None) if hasattr(lct, "tzinfo") else lct
+        lct_naive = lct.replace(tzinfo=None) if (hasattr(lct, "tzinfo") and lct.tzinfo) else lct
         now_naive = now_ist.replace(tzinfo=None)
         data_age_min = round((now_naive - lct_naive).total_seconds() / 60, 1)
     except Exception:
         data_age_min = 0
+
+    # Market hours: 9:15-15:30 IST Mon-Fri
+    market_open  = now_ist.replace(hour=9,  minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    is_market_hours = (now_ist.weekday() < 5 and
+                       market_open <= now_ist <= market_close)
+
+    # During market hours, reject data older than 60 min — stale Kite session
+    if is_market_hours and data_age_min > 60:
+        return {
+            "error": (
+                f"Data is {data_age_min:.0f} min old — Kite session likely expired. "
+                "Please logout and re-login via the Login Kite button, then click Analyse again."
+            ),
+            "data_age_min": data_age_min,
+            "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+        }
 
     # ── Higher timeframe context ──────────────────────────────────────────────
     df_1h = df_daily = None

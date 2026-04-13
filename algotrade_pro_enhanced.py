@@ -8554,11 +8554,11 @@ async function _loadPremarket() {
         const isBuy = c.bias === 'BUY' || c.bias === 'WATCH_BUY';
         const col = isBuy ? 'var(--green)' : c.bias === 'SELL' || c.bias === 'WATCH_SELL' ? 'var(--red)' : 'var(--yellow)';
         return '<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:7px;margin-bottom:5px;background:var(--panel2);border:1px solid var(--border);cursor:pointer" data-sym="' + c.symbol + '">'
-          + '<div><span style="font-size:.82rem;font-weight:700;font-family:\'JetBrains Mono\',monospace">' + c.symbol + '</span>'
+          + '<div><span style="font-size:.82rem;font-weight:700;font-family:JetBrains Mono,monospace">' + c.symbol + '</span>'
           + '<span style="font-size:.66rem;color:' + col + ';margin-left:6px">' + c.bias + '</span>'
           + '<div style="font-size:.65rem;color:var(--muted);margin-top:2px">' + c.notes.join(' · ') + '</div></div>'
           + '<div style="text-align:right;font-size:.7rem">'
-          + '<div style="font-family:\'JetBrains Mono\',monospace">₹' + c.close.toFixed(2) + '</div>'
+          + '<div style="font-family:JetBrains Mono,monospace">₹' + c.close.toFixed(2) + '</div>'
           + '<div style="color:' + (c.chg_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (c.chg_pct >= 0 ? '+' : '') + c.chg_pct + '%</div>'
           + '</div></div>';
       }).join('')

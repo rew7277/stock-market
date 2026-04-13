@@ -3950,7 +3950,13 @@ class SMCEngine:
 
         if not session_tradeable:
             notes.append("⚠️ Session filter: not a tradeable window")
-            return "WAIT", 0.0, (curr, curr), curr, curr, curr, curr, curr, notes
+            _atr_est = atr if atr > 0 else curr * 0.005
+            _sl_def  = round(curr - _atr_est * 1.5, 2)
+            _t1_def  = round(curr + _atr_est * 1.0, 2)
+            _t2_def  = round(curr + _atr_est * 2.0, 2)
+            _t3_def  = round(curr + _atr_est * 3.0, 2)
+            _t4_def  = round(curr + _atr_est * 4.0, 2)
+            return "WAIT", 0.0, (curr - _atr_est*0.2, curr + _atr_est*0.2), _sl_def, _t1_def, _t2_def, _t3_def, _t4_def, notes
 
         # Find nearest OB to price
         bull_ob_active = next((o for o in obs
@@ -8911,10 +8917,21 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
             engine_votes[eng] = d
 
     # ── Confluence rule: 2+ engines must agree ────────────────────────────────
+    # Block any signal if session is not tradeable (SMC says so)
+    _session_ok = not smc_res or getattr(smc_res, "session_tradeable", True)
     if votes["BUY"] >= 2:
         final_dir = "BUY"
     elif votes["SELL"] >= 2:
         final_dir = "SELL"
+    elif not _session_ok:
+        # Session closed — never tiebreak into a real signal
+        _snote = getattr(smc_res, "session_note", "Session not tradeable")
+        return {
+            "symbol": symbol, "signal": "WAIT", "current_price": current_price,
+            "reason": f"Session not tradeable: {_snote}. Market opens 9:15 AM IST.",
+            "engines": engine_votes, "data_age_min": data_age_min,
+            "fetched_at": now_ist.strftime("%H:%M:%S IST"),
+        }
     else:
         # Try VWAP tiebreak when exactly 1 engine signals
         vwap_tb = getattr(smc_res, "vwap", None)
@@ -8955,9 +8972,11 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
         sl_raw     = smc_res.smc_sl
         sl         = round(float(sl_raw), 2) if sl_raw else None
         confidence = round(float(smc_res.smc_confidence))
-        # Derive Fib targets from risk
+        # Derive Fib targets from risk — use ATR floor to prevent zero-risk collapse
         em   = (entry_low + entry_high) / 2
+        _atr_now = float((df["high"] - df["low"]).rolling(14).mean().dropna().iloc[-1]) if len(df) >= 14 else em * 0.005
         risk = abs(em - sl) if sl else em * 0.005
+        risk = max(risk, _atr_now * 0.5)  # minimum risk = 0.5x ATR to prevent flat targets
         if final_dir == "BUY":
             t1 = round(em + risk * 1.0,   2)
             t2 = round(em + risk * 1.272, 2)

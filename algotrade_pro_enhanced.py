@@ -2223,9 +2223,12 @@ class KiteManager:
             access_token = data.get("access_token", "")
             if not access_token:
                 return
-            # Only attempt to load if saved today
-            if saved_date != date.today().isoformat():
-                log.info("⏰ Saved token is from a previous day -- need fresh login")
+            # Only load if saved TODAY in IST (Railway runs UTC — must use IST date)
+            from datetime import timezone as _tz
+            _IST = _tz(timedelta(hours=5, minutes=30))
+            today_ist = datetime.now(tz=_IST).date().isoformat()
+            if saved_date != today_ist:
+                log.info(f"⏰ Saved token is from {saved_date}, today IST is {today_ist} -- need fresh login")
                 self._delete_token()
                 return
             # Set token and VALIDATE with live API call
@@ -2262,8 +2265,11 @@ class KiteManager:
 
     def _save_token(self, token: str):
         try:
+            from datetime import timezone as _tz
+            _IST = _tz(timedelta(hours=5, minutes=30))
+            today_ist = datetime.now(tz=_IST).date().isoformat()
             with open(self._token_path(), "w") as f:
-                json.dump({"access_token": token, "date": date.today().isoformat()}, f)
+                json.dump({"access_token": token, "date": today_ist}, f)
         except Exception as e:
             log.warning(f"Could not save token: {e}")
 
@@ -2296,26 +2302,38 @@ class KiteManager:
         if not self.is_authenticated:
             return pd.DataFrame()
         import time as _time
+        # CRITICAL: Railway runs UTC. Kite needs IST datetimes.
+        IST = timezone(timedelta(hours=5, minutes=30))
         for attempt in range(3):
             try:
-                to_date = datetime.now()
-                from_date = to_date - timedelta(days=days)
-                records = self.kite.historical_data(instrument_token, from_date, to_date, interval)
+                to_dt   = datetime.now(tz=IST).replace(tzinfo=None)   # naive IST
+                from_dt = to_dt - timedelta(days=days)
+                records = self.kite.historical_data(instrument_token, from_dt, to_dt, interval)
+                if not records:
+                    log.warning(f"Kite returned 0 records for token {instrument_token} ({interval}, {days}d)")
+                    return pd.DataFrame()
                 df = pd.DataFrame(records)
                 if not df.empty:
                     df.rename(columns={"date": "timestamp"}, inplace=True)
                     df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    last_ts = df["timestamp"].iloc[-1]
+                    age_min = round((to_dt - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+                    log.info(f"Fetched {len(df)} candles for token {instrument_token} ({interval}). Last: {last_ts}, age: {age_min:.0f} min")
                 return df
             except Exception as e:
                 err_str = str(e).lower()
                 if "too many" in err_str or "rate" in err_str or "429" in err_str:
-                    wait = 2 ** attempt  # 1s, 2s, 4s
-                    log.warning(f"Historical data rate-limited (attempt {attempt+1}/3) -- retrying in {wait}s")
+                    wait = 2 ** attempt
+                    log.warning(f"Rate-limited (attempt {attempt+1}/3) -- retrying in {wait}s")
                     _time.sleep(wait)
                     continue
-                log.error(f"Historical data error: {e}")
+                if "token" in err_str or "session" in err_str or "auth" in err_str or "403" in err_str or "401" in err_str:
+                    log.error(f"Kite auth error — token expired: {e}")
+                    self.is_authenticated = False   # force re-login
+                    return pd.DataFrame()
+                log.error(f"Historical data error (token {instrument_token}, {interval}): {e}")
                 return pd.DataFrame()
-        log.error(f"Historical data: gave up after 3 attempts (rate limit)")
+        log.error(f"Historical data: gave up after 3 attempts")
         return pd.DataFrame()
 
     def get_instruments(self, exchange: str = "NSE") -> List[Dict]:
@@ -5556,6 +5574,9 @@ async def get_patterns(symbol: str, interval: str = "3minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty:
         return JSONResponse({"error": "No candle data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale:
+        return JSONResponse(stale, status_code=200)
     detections = pattern_detector.detect_all_patterns(df, symbol, interval)
 
     # Deduplicate: keep only the BEST (highest confidence) detection per pattern type
@@ -5779,6 +5800,8 @@ async def get_structure_setups(symbol: str, interval: str = "15minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 40:
         return JSONResponse({"error": "Not enough data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     setups = structure_engine.detect_setups(df, symbol, interval)
 
@@ -5820,6 +5843,8 @@ async def get_ict_analysis(symbol: str, interval: str = "15minute"):
         df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty or len(df) < 30:
         return JSONResponse({"error": "Not enough data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     # Daily data for HTF bias
     df_daily = None
@@ -5932,6 +5957,8 @@ async def get_fno_signals(symbol: str, interval: str = "5minute"):
     df = kite_manager.get_historical_data(token, interval, days_back)
     if df.empty:
         return JSONResponse({"error": "No historical data"}, status_code=404)
+    stale = _guard_freshness(df, symbol)
+    if stale: return JSONResponse(stale, status_code=200)
 
     # ── 3. ATR ───────────────────────────────────────────────────────────────
     if len(df) >= 14:
@@ -6106,6 +6133,10 @@ async def get_smc_plus(symbol: str, interval: str = "15minute"):
     if df.empty or len(df) < 20:
         return JSONResponse({"error": "No data"}, status_code=404)
 
+    stale = _guard_freshness(df, symbol)
+    if stale:
+        return JSONResponse(stale, status_code=200)
+
     df_1h = None
     try:
         with _kite_semaphore:
@@ -6182,9 +6213,12 @@ async def get_orb(symbol: str, interval: str = "5minute"):
 
     if df.empty or len(df) < 5:
         return JSONResponse({"error": "Insufficient data -- market may not be open yet"}, status_code=404)
+    stale = _guard_freshness(df, symbol, max_age=90)
+    if stale: return JSONResponse(stale, status_code=200)
 
     # ── Check daily ORB cache first ───────────────────────────────────────────
-    today_str  = datetime.now().strftime("%Y-%m-%d")
+    _IST_orb = timezone(timedelta(hours=5, minutes=30))
+    today_str  = datetime.now(tz=_IST_orb).strftime("%Y-%m-%d")
     cache_key  = f"{symbol}:{today_str}"
     cached_sig = _orb_cache.get(cache_key)
 
@@ -6874,6 +6908,9 @@ async def institutional_scan(
                 df = kite_manager.get_historical_data(token, interval, 10)
             if df.empty or len(df) < 30:
                 return symbol, None, None, None
+            # Skip stale data during market hours
+            if _is_market_hours() and _data_age_minutes(df) > 75:
+                return symbol, None, None, None
             df_1h = df_daily = None
             try:
                 with _kite_semaphore:
@@ -7089,6 +7126,7 @@ async def institutional_scan(
                 "pdl":           round(inst_levels.pdl, 2),
                 "notes":         key_notes,
                 "interval":      interval,
+                "confluence_score": confluence_score,
             })
 
         except Exception as e:
@@ -7510,12 +7548,21 @@ header h1 span{color:var(--accent)}
           <span>Live Signal — <span id="sigSym" style="color:var(--accent)">--</span></span>
           <div style="display:flex;align-items:center;gap:8px">
             <span id="sigAge" style="font-size:.66rem;color:var(--muted)"></span>
+            <span id="sigTimerEl" style="font-size:.66rem;margin-left:6px"></span>
             <button class="btn primary" onclick="loadSignal()" style="padding:4px 12px;font-size:.72rem">Analyse</button>
           </div>
         </div>
         <div id="sigBody">
           <p class="muted" style="font-size:.78rem">Select a symbol from the sidebar, then click Analyse.</p>
         </div>
+      </div>
+      <!-- Pre-market watchlist -->
+      <div class="card" id="preMktCard" style="padding:16px;display:none">
+        <div class="card-title" style="justify-content:space-between">
+          <span>Pre-market Watchlist</span>
+          <span style="font-size:.66rem;color:var(--yellow)">Market opens at 9:15 AM</span>
+        </div>
+        <div id="preMktBody"><p class="muted" style="font-size:.78rem">Loading candidates...</p></div>
       </div>
       <!-- Quick scanner -->
       <div class="card" style="padding:16px">
@@ -7646,7 +7693,7 @@ function selectSym(s) {
   document.getElementById('symInput').value = s;
   document.querySelectorAll('.sym-item').forEach(el => el.classList.toggle('active', el.textContent === s));
   const panelMap = {
-    signal: 'sigBody', smc: 'smcBody', ict: 'ictBody', structure: 'structureBody',
+    signal: 'sigBody', smc: 'smcBody', ict: 'ictBody', structure: 'strBody',
     orb: 'orbBody', patterns: 'patBody', fno: 'fnoBody', journal: 'journalBody',
   };
   const panelId = panelMap[currentTab];
@@ -7710,6 +7757,24 @@ const fmtN = v => v == null ? '--' : parseFloat(v).toLocaleString('en-IN', {mini
 const dirColor = d => (d==='BUY'||d==='LONG') ? 'green' : (d==='SELL'||d==='SHORT') ? 'red' : 'yellow';
 const sigEmoji = d => (d==='BUY'||d==='LONG') ? '[BUY]' : (d==='SELL'||d==='SHORT') ? '[SELL]' : '[WAIT]';
 
+// ── Global stale-data banner ─────────────────────────────────────────────────
+// Returns true if response is stale (caller should return early)
+function checkStale(r, bodyId) {
+  if (!r || !r.stale) return false;
+  const age = r.data_age_min ? Math.round(r.data_age_min) : '?';
+  document.getElementById(bodyId).innerHTML = `
+    <div style="padding:16px 18px;border-radius:10px;background:rgba(255,69,96,.08);border:1px solid rgba(255,69,96,.3);margin-bottom:12px">
+      <div style="font-size:.95rem;font-weight:800;color:var(--red);margin-bottom:6px">Stale Data — ${age} min old</div>
+      <div style="font-size:.78rem;color:var(--muted);margin-bottom:12px">${r.error}</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <a href="/auth/logout" style="background:var(--panel2);color:var(--text);padding:6px 14px;border-radius:6px;font-size:.76rem;font-weight:700;text-decoration:none;border:1px solid var(--border)">Step 1: Logout</a>
+        <a href="/auth/login"  style="background:var(--accent);color:#000;padding:6px 14px;border-radius:6px;font-size:.76rem;font-weight:700;text-decoration:none">Step 2: Login Kite</a>
+      </div>
+      <div style="margin-top:10px;font-size:.7rem;color:var(--muted)">After logging in, click the tab again to refresh.</div>
+    </div>`;
+  return true;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  SIGNAL TAB — Simple live BUY/SELL card
 // ════════════════════════════════════════════════════════════════════════════
@@ -7727,6 +7792,7 @@ async function loadSignal() {
       : r.fetched_at ? `<span style="color:var(--muted)">Data: ${r.fetched_at} (${Math.round(age)} min ago)</span>` : '';
     document.getElementById('sigAge').innerHTML = ageStr;
     document.getElementById('sigBody').innerHTML = renderSignalCard(r);
+    if (r.signal !== 'WAIT') _startSignalTimer('15minute');
   } catch(e) {
     document.getElementById('sigBody').innerHTML = `<p class="red" style="font-size:.78rem">Error: ${e.message}</p>`;
   }
@@ -7925,6 +7991,7 @@ async function loadSmc() {
   document.getElementById('smcSym').textContent = currentSym; loading('smcBody');
   try {
     const r = await fetch('/api/smc-plus/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'smcBody')) return;
     if (r.error) { document.getElementById('smcBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     const s = r.smc, il = r.inst_levels, cs = r.combined_signal;
     const dc = dirColor(s.smc_signal);
@@ -7981,6 +8048,7 @@ async function loadIct() {
   document.getElementById('ictSym').textContent = currentSym; loading('ictBody');
   try {
     const r = await fetch('/api/ict/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'ictBody')) return;
     if (r.error) { document.getElementById('ictBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     const ict = r.ict, il = r.inst_levels;
     const dc = dirColor(ict.ict_signal==='LONG'?'BUY':'SELL');
@@ -8037,6 +8105,7 @@ async function loadStructure() {
   document.getElementById('strSym').textContent = currentSym; loading('strBody');
   try {
     const r = await fetch('/api/structure/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json());
+    if (checkStale(r, 'strBody')) return;
     if (r.error) { document.getElementById('strBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.setups || r.setups.length === 0) {
       document.getElementById('strBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">[WAIT] No Active Setup</div><div style="font-size:.73rem;color:var(--muted);margin-top:4px">Waiting for BOS + pullback into OTE zone (61.8%-78.6%). Min RR 1.8x required.</div></div>';
@@ -8073,45 +8142,119 @@ async function loadStructure() {
   } catch(e) { document.getElementById('strBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function _confluenceDots(score, max) {
+  max = max || 5;
+  let h = '';
+  for (let i = 0; i < max; i++) {
+    h += '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:2px;background:'
+      + (i < score ? 'var(--accent)' : 'var(--border)') + '"></span>';
+  }
+  return '<span title="Confluence ' + score + '/' + max + '">' + h + '</span>';
+}
+
+function _intervalMinutes(iv) {
+  if (iv === 'minute') return 1;
+  const m = iv.match(/(\d+)minute/); if (m) return parseInt(m[1]);
+  if (iv === '60minute' || iv === 'hour') return 60;
+  return 15;
+}
+
+function _expiryBadge(intervalStr) {
+  // A signal is valid for ~5 candles; show how many are left (rough)
+  const mins = _intervalMinutes(intervalStr);
+  const totalMins = mins * 5;
+  const now = new Date();
+  const hhmm = now.getHours() * 60 + now.getMinutes();
+  const close = 15 * 60 + 30;
+  const left = Math.min(totalMins, close - hhmm);
+  if (left <= 0) return '<span style="font-size:.62rem;color:var(--red);padding:1px 6px;border-radius:4px;background:rgba(255,69,96,.12)">Expired</span>';
+  const candles = Math.max(0, Math.floor(left / mins));
+  const col = candles >= 4 ? 'var(--green)' : candles >= 2 ? 'var(--yellow)' : 'var(--red)';
+  return '<span style="font-size:.62rem;color:' + col + ';padding:1px 6px;border-radius:4px;background:rgba(168,255,62,.08)">' + candles + ' candles left</span>';
+}
+
+function _renderScanCard(s, iv) {
+  const isBuy = s.direction === 'BUY';
+  const col   = isBuy ? 'var(--green)' : 'var(--red)';
+  const qcol  = s.quality === 'A+' ? '#ffd700' : 'var(--green)';
+  const cs    = s.confluence_score != null ? s.confluence_score : (s.notes || []).join(' ').match(/Confluence:\s*(\d)/)?.[1] || 0;
+  const rr    = parseFloat(s.rr_t2 || 0);
+  const posSize = s.position_size > 0 ? `<span style="font-size:.65rem;color:var(--yellow)">Qty: ${s.position_size} shares</span>` : '';
+  return `
+  <div class="scan-item ${s.direction}" data-sym="${s.symbol}" style="cursor:pointer">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px;flex-wrap:wrap;gap:4px">
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+        <span class="scan-sym" style="color:${col}">${s.symbol}</span>
+        <span class="chip ${isBuy?'bull':'bear'}">${s.direction}</span>
+        <span style="font-size:.68rem;font-weight:700;color:${qcol};padding:1px 7px;border-radius:999px;border:1px solid ${qcol}">${s.quality}</span>
+        ${_expiryBadge(iv)}
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        ${_confluenceDots(parseInt(cs))}
+        <span style="font-size:.68rem;color:var(--sub)">${parseFloat(s.confidence).toFixed(0)}% conf</span>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(90px,1fr));gap:6px;margin-bottom:8px">
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">CMP</div>
+        <div style="font-size:.8rem;font-weight:700;font-family:'JetBrains Mono',monospace">₹${fmtN(s.current_price)}</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid rgba(168,255,62,.2)">
+        <div style="font-size:.6rem;color:var(--muted)">Entry</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:${col}">₹${fmtN(s.entry_zone[0])}</div>
+        <div style="font-size:.6rem;color:var(--muted)">to ₹${fmtN(s.entry_zone[1])}</div>
+      </div>
+      <div style="background:rgba(255,69,96,.07);border-radius:6px;padding:6px 8px;border:1px solid rgba(255,69,96,.2)">
+        <div style="font-size:.6rem;color:var(--muted)">Stop Loss</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--red)">₹${fmtN(s.stop_loss)}</div>
+        <div style="font-size:.6rem;color:${rr>=2?'var(--green)':'var(--yellow)'}">R:R ${rr}x</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">T1</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--yellow)">₹${fmtN(s.target_1)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">30–40% exit</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid rgba(168,255,62,.15)">
+        <div style="font-size:.6rem;color:var(--muted)">T2</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--green)">₹${fmtN(s.target_2)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">Main target</div>
+      </div>
+      <div style="background:var(--panel);border-radius:6px;padding:6px 8px;border:1px solid var(--border)">
+        <div style="font-size:.6rem;color:var(--muted)">T3</div>
+        <div style="font-size:.78rem;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--accent)">₹${fmtN(s.target_3)}</div>
+        <div style="font-size:.6rem;color:var(--muted)">Runner 20%</div>
+      </div>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:.65rem;color:var(--muted)">
+      ${s.in_killzone ? '<span style="color:var(--yellow)">Killzone: '+s.killzone+'</span>' : ''}
+      <span>Daily: ${s.daily_bias}</span>
+      <span>Po3: ${s.po3_phase}</span>
+      ${posSize}
+    </div>
+  </div>`;
+}
+
 async function runScan() {
   const interval = document.getElementById('scanInterval').value;
   const minConf  = document.getElementById('scanMinConf').value;
-  const limit    = document.getElementById('scanLimit').value;  // FIX #10
+  const limit    = document.getElementById('scanLimit').value;
   loading('scanBody');
   try {
     const r = await fetch('/api/institutional-scan?interval=' + interval + '&min_conf=' + minConf + '&limit=' + limit).then(r => r.json());
+    if (checkStale(r, 'scanBody')) return;
     if (r.error) { document.getElementById('scanBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signals || r.signals.length === 0) {
       document.getElementById('scanBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">No setups found</div><div class="muted" style="font-size:.73rem;margin-top:3px">Scanned ' + r.scanned + ' symbols. No multi-engine confluence. Try lower confidence or different interval.</div></div>';
       return;
     }
-    // Notify on first/new top signal
     if (r.signals[0] && typeof _notifySignal === 'function') {
       _notifySignal(r.signals[0].symbol, r.signals[0].direction, r.signals[0].quality);
     }
-    document.getElementById('scanBody').innerHTML = '<div style="font-size:.7rem;color:var(--muted);margin-bottom:7px">Found ' + r.total_found + ' from ' + r.scanned + ' symbols. Showing top ' + r.signals.length + '.'
-      + (r.scanned_at ? ' <span style="color:var(--accent)">Scanned at ' + r.scanned_at + '</span>' : '') + '</div>'
-      + r.signals.map(s => {
-        const posSize = s.position_size && s.position_size > 0 ? '<span>📦 Qty: <b class="yellow">' + s.position_size + ' shares</b></span>' : '';
-        return '<div class="scan-item ' + s.direction + '" data-sym="' + s.symbol + '" style="cursor:pointer">'
-        + '<div class="scan-hdr"><div><span class="scan-sym">' + s.symbol + '</span>'
-        + '<span class="chip ' + (s.direction==='BUY'?'bull':'bear') + '" style="margin-left:4px">' + s.direction + '</span>'
-        + '<span class="quality-' + (s.quality==='A+'?'Ap':s.quality) + '" style="font-size:.78rem;margin-left:3px">' + s.quality + '</span></div>'
-        + '<span class="' + (s.direction==='BUY'?'green':'red') + '" style="font-size:.7rem">' + s.confidence.toFixed(0) + '% | ' + s.engine_votes + '</span></div>'
-        + '<div style="font-size:.7rem;margin-bottom:4px">Rs.' + fmtN(s.current_price) + ' | Entry: Rs.' + fmtN(s.entry_zone[0]) + '-' + fmtN(s.entry_zone[1]) + ' | SL: <span class="red">Rs.' + fmtN(s.stop_loss) + '</span></div>'
-        + '<div class="scan-targets">'
-        + '<span class="scan-t"><span class="muted">T1:</span> <b class="yellow">Rs.' + fmtN(s.target_1) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T2:</span> <b class="green">Rs.' + fmtN(s.target_2) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T3:</span> <b class="accent">Rs.' + fmtN(s.target_3) + '</b></span>'
-        + '<span class="scan-t"><span class="muted">T4:</span> <b class="purple">Rs.' + fmtN(s.target_4) + '</b></span>'
-        + '<span class="scan-t">RR T2: <b class="' + (s.rr_t2>=2?'green':'yellow') + '">' + s.rr_t2 + 'x</b></span>'
-        + '</div>'
-        + (posSize ? '<div style="font-size:.67rem;margin-top:3px;display:flex;gap:10px;flex-wrap:wrap">' + posSize + '</div>' : '')
-        + '<div style="font-size:.66rem;color:var(--muted);margin-top:3px">'
-        + (s.in_killzone ? '<span class="yellow">Killzone: ' + s.killzone + ' </span>' : '')
-        + 'Daily: ' + s.daily_bias + ' | PDH:' + fmtN(s.pdh) + ' PDL:' + fmtN(s.pdl)
-        + '</div></div>';
-      }).join('');
+    document.getElementById('scanBody').innerHTML =
+      '<div style="font-size:.7rem;color:var(--muted);margin-bottom:10px">Found <b style="color:var(--text)">' + r.signals.length + '</b> signals from ' + r.scanned + ' stocks'
+      + (r.scanned_at ? ' · <span style="color:var(--accent)">' + r.scanned_at + '</span>' : '') + '</div>'
+      + r.signals.map(s => _renderScanCard(s, interval)).join('');
   } catch(e) { document.getElementById('scanBody').innerHTML = '<p class="red">Error: ' + e.message + '</p>'; }
 }
 
@@ -8140,6 +8283,7 @@ async function loadOrb() {
   document.getElementById('orbSym').textContent = currentSym; loading('orbBody');
   try {
     const r = await fetch('/api/orb/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json());
+    if (checkStale(r, 'orbBody')) return;
     if (r.error) { document.getElementById('orbBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
     if (!r.signal) { document.getElementById('orbBody').innerHTML = '<div class="signal-box WAIT"><div class="sig-dir yellow">[WAIT] No ORB Signal</div><div class="muted" style="font-size:.73rem;margin-top:3px">' + (r.message||'Waiting for 9:30+ breakout.') + '</div></div>'; return; }
     const s = r.signal, dc = s.direction==='BULL'?'green':'red';
@@ -8170,6 +8314,7 @@ async function loadPatterns() {
       fetch('/api/patterns/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json()),
       fetch('/api/fibonacci/' + encodeURIComponent(currentSym) + '?interval=15minute').then(r => r.json()),
     ]);
+    if (checkStale(pr, 'patBody')) return;
     if (pr.error) { document.getElementById('patBody').innerHTML = '<p class="red">' + pr.error + '</p>'; return; }
     let patterns = pr.patterns || [];
 
@@ -8208,6 +8353,7 @@ async function loadFno() {
   document.getElementById('fnoSym').textContent = currentSym; loading('fnoBody');
   try {
     const r = await fetch('/api/fno/' + encodeURIComponent(currentSym) + '?interval=5minute').then(r => r.json());
+    if (checkStale(r, 'fnoBody')) return;
     if (r.error) { document.getElementById('fnoBody').innerHTML = '<p class="red">' + r.error + '</p>'; return; }
 
     // Fix #8: PCR panel at top of F&O tab
@@ -8362,6 +8508,77 @@ setTimeout(() => { selectSym('RELIANCE'); _startAutoRefresh(); }, 600);
       if (items[next]) items[next].click();
     }
   });
+})();
+
+// ── Auto-load on page start ─────────────────────────────────────────────────
+// ── Signal expiry timer on Signal tab ───────────────────────────────────────
+let _sigTimerInterval = null;
+function _startSignalTimer(intervalStr) {
+  if (_sigTimerInterval) clearInterval(_sigTimerInterval);
+  const el = document.getElementById('sigTimerEl');
+  if (!el) return;
+  const mins = _intervalMinutes ? _intervalMinutes(intervalStr) : 15;
+  let remaining = mins * 5 * 60; // 5 candles in seconds
+  function _tick() {
+    if (remaining <= 0) { el.textContent = 'Signal expired'; el.style.color = 'var(--red)'; clearInterval(_sigTimerInterval); return; }
+    const m = Math.floor(remaining / 60), s = remaining % 60;
+    el.textContent = 'Valid ~' + m + ':' + String(s).padStart(2,'0');
+    el.style.color = remaining > 300 ? 'var(--green)' : remaining > 120 ? 'var(--yellow)' : 'var(--red)';
+    remaining--;
+  }
+  _tick();
+  _sigTimerInterval = setInterval(_tick, 1000);
+}
+
+// ── Pre-market watchlist ─────────────────────────────────────────────────────
+async function _loadPremarket() {
+  const now = new Date();
+  const istOffset = 5.5 * 60;
+  const utcMin = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const istMin = (utcMin + istOffset) % (24 * 60);
+  const isPreMkt = istMin >= 8 * 60 && istMin < 9 * 60 + 15;
+  const card = document.getElementById('preMktCard');
+  if (!card) return;
+  if (!isPreMkt) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  try {
+    const r = await fetch('/api/premarket').then(x => x.json());
+    if (!r.candidates || !r.candidates.length) {
+      document.getElementById('preMktBody').innerHTML = '<p class="muted" style="font-size:.78rem">No strong candidates found. Market data may not be updated yet.</p>';
+      return;
+    }
+    document.getElementById('preMktBody').innerHTML =
+      '<div style="font-size:.7rem;color:var(--muted);margin-bottom:8px">Top candidates for today · ' + (r.generated_at||'') + '</div>'
+      + r.candidates.map(c => {
+        const isBuy = c.bias === 'BUY' || c.bias === 'WATCH_BUY';
+        const col = isBuy ? 'var(--green)' : c.bias === 'SELL' || c.bias === 'WATCH_SELL' ? 'var(--red)' : 'var(--yellow)';
+        return '<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:7px;margin-bottom:5px;background:var(--panel2);border:1px solid var(--border);cursor:pointer" data-sym="' + c.symbol + '">'
+          + '<div><span style="font-size:.82rem;font-weight:700;font-family:'JetBrains Mono',monospace">' + c.symbol + '</span>'
+          + '<span style="font-size:.66rem;color:' + col + ';margin-left:6px">' + c.bias + '</span>'
+          + '<div style="font-size:.65rem;color:var(--muted);margin-top:2px">' + c.notes.join(' · ') + '</div></div>'
+          + '<div style="text-align:right;font-size:.7rem">'
+          + '<div style="font-family:'JetBrains Mono',monospace">₹' + c.close.toFixed(2) + '</div>'
+          + '<div style="color:' + (c.chg_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">' + (c.chg_pct >= 0 ? '+' : '') + c.chg_pct + '%</div>'
+          + '</div></div>';
+      }).join('')
+      + '<div style="font-size:.66rem;color:var(--muted);margin-top:8px;padding:6px 10px;background:var(--panel2);border-radius:6px">'
+      + (r.note || '') + '</div>';
+  } catch(e) {
+    document.getElementById('preMktBody').innerHTML = '<p class="red" style="font-size:.75rem">Pre-market fetch error: ' + e.message + '</p>';
+  }
+}
+
+(function _autoLoad() {
+  setTimeout(async () => {
+    try {
+      const st = await fetch('/api/auth/status').then(r => r.json());
+      if (st.authenticated) {
+        _loadPremarket();
+        const first = SYMBOLS[0] || 'RELIANCE';
+        selectSym(first);
+      }
+    } catch(e) {}
+  }, 800);
 })();
 
 // ── Fix #12: Browser notifications when new signal fires ─────────────────────
@@ -8531,6 +8748,59 @@ async def update_journal_entry(entry_id: int, request: Request):
         return {"ok": True, "id": entry_id, "outcome": outcome, "pnl": pnl}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  DATA FRESHNESS HELPER  —  used by ALL API endpoints
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _data_age_minutes(df: pd.DataFrame) -> float:
+    """Return minutes since the last candle timestamp (IST-aware)."""
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        last_ts = df["timestamp"].iloc[-1]
+        now_ist = datetime.now(tz=IST).replace(tzinfo=None)
+        last_naive = last_ts.replace(tzinfo=None) if hasattr(last_ts, "tzinfo") and last_ts.tzinfo else last_ts
+        return round((now_ist - last_naive).total_seconds() / 60, 1)
+    except Exception:
+        return 0.0
+
+
+def _is_market_hours() -> bool:
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now = datetime.now(tz=IST)
+    return (now.weekday() < 5 and
+            now.replace(hour=9, minute=15, second=0, microsecond=0) <= now <=
+            now.replace(hour=15, minute=30, second=0, microsecond=0))
+
+
+def _stale_error(age_min: float, symbol: str) -> Dict:
+    """Standard stale-data error dict returned to the frontend."""
+    IST = timezone(timedelta(hours=5, minutes=30))
+    return {
+        "stale": True,
+        "error": (
+            f"Data is {age_min:.0f} min old for {symbol}. "
+            "Kite session may have expired — please Logout and Login Kite again."
+        ),
+        "data_age_min": age_min,
+        "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+    }
+
+
+def _guard_freshness(df: pd.DataFrame, symbol: str, max_age: int = 75) -> Optional[Dict]:
+    """
+    Returns a stale error dict if data is too old during market hours.
+    Returns None if data is fresh (caller proceeds normally).
+    max_age: minutes — default 75 (one 15-min candle + 1 hour buffer)
+    """
+    if not _is_market_hours():
+        return None          # outside market hours — age is expected to be large
+    age = _data_age_minutes(df)
+    if age > max_age:
+        return _stale_error(age, symbol)
+    return None
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -8835,6 +9105,126 @@ async def quick_scan_simple(limit: int = 20, interval: str = "15minute"):
         "fetched_at":    datetime.now(tz=IST).strftime("%H:%M:%S IST"),
     }
 
+
+
+
+@app.get("/api/premarket")
+async def get_premarket_watchlist():
+    """
+    Pre-market candidates: uses previous day's structure to find
+    the top 5 symbols most likely to have good setups at market open.
+    Uses daily candles — no 15-min data needed (market not open yet).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    candidates = []
+    scan_syms = list(DEMO_TOKENS.keys())[:20]
+
+    def _check_sym(symbol):
+        try:
+            token = get_instrument_token(symbol)
+            if not token: return None
+            with _kite_semaphore:
+                df = kite_manager.get_historical_data(token, "day", 10)
+            if df.empty or len(df) < 5: return None
+            inst = calculate_institutional_levels(df, symbol)
+            close  = float(df["close"].iloc[-1])
+            prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else close
+            chg_pct = round((close - prev_close) / prev_close * 100, 2)
+            # Score: proximity to PDH/PDL, daily trend strength
+            score = 0
+            bias = "NEUTRAL"
+            note = []
+            if abs(close - inst.pdh) / inst.pdh < 0.005:
+                score += 2; note.append("Near PDH"); bias = "WATCH_SELL"
+            if abs(close - inst.pdl) / inst.pdl < 0.005:
+                score += 2; note.append("Near PDL"); bias = "WATCH_BUY"
+            if close > inst.pdh:
+                score += 3; note.append("Above PDH — breakout"); bias = "BUY"
+            if close < inst.pdl:
+                score += 3; note.append("Below PDL — breakdown"); bias = "SELL"
+            if abs(chg_pct) > 1.5:
+                score += 1; note.append(f"Big move {chg_pct:+.1f}%")
+            if score < 2: return None
+            return {
+                "symbol": symbol, "close": close, "chg_pct": chg_pct,
+                "bias": bias, "score": score, "notes": note,
+                "pdh": round(inst.pdh, 2), "pdl": round(inst.pdl, 2),
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        for r in ex.map(_check_sym, scan_syms):
+            if r: candidates.append(r)
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "candidates": candidates[:8],
+        "generated_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+        "note": "Based on yesterday's close vs PDH/PDL. Confirm at 9:30 AM with live signal.",
+    }
+
+@app.get("/api/debug/kite")
+async def debug_kite():
+    """
+    Diagnostic endpoint — shows exactly what Kite is returning.
+    Visit /api/debug/kite in browser to diagnose data issues.
+    """
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+    info = {
+        "server_utc":        datetime.utcnow().isoformat(),
+        "server_ist":        now_ist.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "kite_authenticated": kite_manager.is_authenticated,
+        "token_present":     bool(kite_manager.access_token),
+    }
+    if not kite_manager.is_authenticated:
+        info["error"] = "Not authenticated — click Login Kite"
+        return info
+    # Profile check
+    try:
+        profile = kite_manager.kite.profile()
+        info["kite_user"]  = profile.get("user_name", "?")
+        info["kite_email"] = profile.get("email", "?")
+        info["profile_ok"] = True
+    except Exception as e:
+        info["profile_error"] = str(e)
+        info["profile_ok"]    = False
+    # Test historical data for NIFTY 50
+    try:
+        token  = 256265  # NIFTY 50
+        ist_now   = now_ist.replace(tzinfo=None)
+        from_dt   = ist_now - timedelta(days=2)
+        records   = kite_manager.kite.historical_data(token, from_dt, ist_now, "15minute")
+        if records:
+            last_ts  = records[-1]["date"]
+            age_min  = round((ist_now - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+            info["nifty50_last_candle"] = str(last_ts)
+            info["nifty50_last_close"]  = records[-1]["close"]
+            info["nifty50_data_age_min"] = age_min
+            info["nifty50_candles_returned"] = len(records)
+            info["nifty50_ok"] = age_min < 60
+        else:
+            info["nifty50_error"] = "Kite returned 0 records"
+    except Exception as e:
+        info["nifty50_error"] = str(e)
+    # Test RELIANCE
+    try:
+        token  = 738561
+        records = kite_manager.kite.historical_data(token, from_dt, ist_now, "15minute")
+        if records:
+            last_ts  = records[-1]["date"]
+            age_min  = round((ist_now - last_ts.replace(tzinfo=None)).total_seconds() / 60, 1)
+            info["reliance_last_candle"]  = str(last_ts)
+            info["reliance_data_age_min"] = age_min
+            info["reliance_ok"] = age_min < 60
+        else:
+            info["reliance_error"] = "Kite returned 0 records"
+    except Exception as e:
+        info["reliance_error"] = str(e)
+    return info
 
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():

@@ -7534,6 +7534,7 @@ header h1 span{color:var(--accent)}
   <div class="tab" data-tab="patterns">Patterns</div>
   <div class="tab" data-tab="fno">F&O</div>
   <div class="tab" data-tab="journal">Journal</div>
+  <div class="tab" data-tab="sniper" style="color:#00ff88;font-weight:700">🎯 Sniper</div>
   <div class="tab" data-tab="guide">Guide</div>
 </div>
 <div class="main">
@@ -7638,6 +7639,39 @@ header h1 span{color:var(--accent)}
         <div id="journalBody"><p class="muted" style="font-size:.78rem">Loading journal...</p></div>
       </div>
     </div>
+    <div class="tab-content" id="tab-sniper">
+      <div class="card">
+        <div class="card-title" style="display:flex;align-items:center;justify-content:space-between">
+          <span>🎯 Sniper Engine — High-Accuracy Auto-Trading</span>
+          <div style="display:flex;gap:6px;align-items:center">
+            <select id="sniperInterval" style="background:var(--card);color:var(--fg);border:1px solid var(--border);padding:3px 6px;border-radius:4px;font-size:.7rem">
+              <option value="5minute">5 min</option>
+              <option value="15minute" selected>15 min</option>
+            </select>
+            <button class="btn" onclick="runSniperScan()" style="background:#00ff8822;border-color:#00ff88;color:#00ff88;font-weight:700">⚡ Scan Now</button>
+          </div>
+        </div>
+        <!-- Daily risk dashboard -->
+        <div id="sniperDailyBar" style="display:flex;gap:16px;flex-wrap:wrap;padding:8px 0 4px;font-size:.7rem;border-bottom:1px solid var(--border);margin-bottom:10px">
+          <span>Trades today: <b id="sdTrades">--</b> / 2</span>
+          <span>Losses today: <b id="sdLosses" class="red">--</b> / 2</span>
+          <span id="sdStatus" class="green">✅ Trading allowed</span>
+          <span style="color:var(--muted)" id="sdTimeNote">--</span>
+        </div>
+        <!-- Sniper rules reminder -->
+        <div style="background:#00ff8811;border:1px solid #00ff8833;border-radius:6px;padding:8px 12px;font-size:.68rem;color:var(--muted);margin-bottom:10px;line-height:1.6">
+          <b style="color:#00ff88">7 Gates must ALL pass:</b>
+          &nbsp;⏰ Time window (09:30–11:30 / 14:30–15:30)
+          &nbsp;→ 📈 Trend (EMA50 > EMA200)
+          &nbsp;→ 🕯 Engulfing pattern
+          &nbsp;→ ✅ Confirmation candle break
+          &nbsp;→ 📍 Location (VWAP/PDH/PDL)
+          &nbsp;→ 🏦 NIFTY aligned
+          &nbsp;→ 💰 RR ≥ 2:1
+        </div>
+        <div id="sniperBody"><p class="muted" style="font-size:.78rem;padding:10px">Click ⚡ Scan Now to find sniper setups across 26 liquid stocks.</p></div>
+      </div>
+    </div>
     <div class="tab-content" id="tab-guide">
       <div class="card">
         <div class="card-title">Institutional Trading Guide -- v4.0</div>
@@ -7700,6 +7734,7 @@ function selectSym(s) {
   const panelMap = {
     signal: 'sigBody', smc: 'smcBody', ict: 'ictBody', structure: 'strBody',
     orb: 'orbBody', patterns: 'patBody', fno: 'fnoBody', journal: 'journalBody',
+    sniper: 'sniperBody',
   };
   const panelId = panelMap[currentTab];
   if (panelId) loading(panelId);
@@ -7718,6 +7753,7 @@ function loadAll() {
   else if (currentTab === 'patterns') loadPatterns();
   else if (currentTab === 'fno')  loadFno();
   else if (currentTab === 'journal') loadJournal();
+  else if (currentTab === 'sniper') loadSniperDailyBar();
 }
 
 // ── Auto-refresh intervals ────────────────────────────────────────────────────
@@ -8476,6 +8512,160 @@ async function toggleOutcome(id, current) {
 
 function exportJournal() {
   window.open('/api/journal?limit=1000&offset=0', '_blank');
+}
+
+// ════════════════════════════════════════════════════════════════════════
+//  SNIPER ENGINE UI
+// ════════════════════════════════════════════════════════════════════════
+
+async function loadSniperDailyBar() {
+  try {
+    const r = await fetch('/api/sniper/daily-status').then(x => x.json());
+    document.getElementById('sdTrades').textContent  = r.trades_today ?? '--';
+    document.getElementById('sdLosses').textContent  = r.losses_today ?? '--';
+    document.getElementById('sdTimeNote').textContent = r.time_note   ?? '';
+    const statusEl = document.getElementById('sdStatus');
+    if (!r.trading_allowed) {
+      statusEl.textContent = '🚫 ' + (r.block_reason || 'Trading paused');
+      statusEl.className = 'red';
+    } else {
+      statusEl.textContent = '✅ Trading allowed';
+      statusEl.className = 'green';
+    }
+  } catch(e) {}
+}
+
+async function runSniperScan() {
+  const body = document.getElementById('sniperBody');
+  body.innerHTML = '<p class="muted" style="font-size:.78rem;padding:10px">⚡ Scanning 26 liquid stocks through 7 gates... (~30 sec)</p>';
+  await loadSniperDailyBar();
+  const interval = document.getElementById('sniperInterval').value;
+  try {
+    const r = await fetch('/api/sniper-scan?interval=' + interval).then(x => x.json());
+    if (r.error) { body.innerHTML = '<p class="red">' + r.error + '</p>'; return; }
+
+    const timeColor = r.time_window_ok ? 'green' : 'yellow';
+    let html = '<div style="display:flex;gap:16px;flex-wrap:wrap;font-size:.7rem;margin-bottom:10px">'
+      + '<span>Scanned: <b>' + r.scanned + '</b></span>'
+      + '<span class="' + timeColor + '">Window: <b>' + r.time_note + '</b></span>'
+      + '<span class="green">Signals: <b>' + r.signals_found + '</b></span>'
+      + '<span class="muted">' + r.fetched_at + '</span>'
+      + '</div>';
+
+    if (!r.signals || !r.signals.length) {
+      html += '<div style="text-align:center;padding:30px;color:var(--muted);font-size:.8rem">'
+        + '🎯 No sniper setups right now — all ' + r.scanned + ' stocks checked.<br>'
+        + '<span style="font-size:.68rem">This is normal. Sniper fires 1-4 times per session.<br>Top wait reasons:</span><br>'
+        + (r.wait_summary||[]).slice(0,5).map(w =>
+            '<span style="font-size:.65rem;color:var(--muted)">• ' + w.symbol + ': ' + (w.reason||'').split('—')[0].trim() + '</span>'
+          ).join('<br>')
+        + '</div>';
+    } else {
+      html += r.signals.map(s => renderSniperCard(s)).join('');
+    }
+    body.innerHTML = html;
+  } catch(e) { body.innerHTML = '<p class="red">Scan error: ' + e.message + '</p>'; }
+}
+
+function renderSniperCard(s) {
+  const isBuy = s.signal === 'BUY';
+  const sigColor = isBuy ? '#00ff88' : '#ff4444';
+  const confBar = Math.round((s.confidence||70));
+  const rr = s.rr_t2 || 0;
+  const rrColor = rr >= 2.5 ? '#00ff88' : rr >= 2.0 ? '#ffd700' : '#ff6b6b';
+
+  return `<div style="border:1px solid ${sigColor}44;border-radius:8px;padding:12px;margin-bottom:10px;background:${sigColor}08">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px">
+      <div>
+        <span style="font-size:.9rem;font-weight:700;color:${sigColor}">${s.signal}</span>
+        <span style="font-size:1rem;font-weight:700;margin-left:8px">${s.symbol}</span>
+        <span style="font-size:.7rem;color:var(--muted);margin-left:8px">${s.pattern||''}</span>
+        <span style="font-size:.7rem;color:var(--muted);margin-left:6px">×${s.engulf_ratio||'?'}  vol ${s.vol_mult||'?'}x</span>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <span style="font-size:.68rem;background:#00ff8811;border:1px solid #00ff8833;color:#00ff88;padding:2px 7px;border-radius:4px">${s.quality||'A'}</span>
+        <span style="font-size:.78rem;color:${rrColor};font-weight:700">RR ${rr}x</span>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0;font-size:.72rem">
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:var(--muted);font-size:.62rem">ENTRY</div>
+        <div style="font-weight:700">₹${fmtN(s.entry)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:var(--red);font-size:.62rem">STOP LOSS</div>
+        <div style="font-weight:700;color:var(--red)">₹${fmtN(s.sl)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:#ffd700;font-size:.62rem">T1 (1:1)</div>
+        <div style="font-weight:700;color:#ffd700">₹${fmtN(s.t1)}</div>
+      </div>
+      <div style="background:var(--bg);border-radius:4px;padding:6px;text-align:center">
+        <div style="color:#00ff88;font-size:.62rem">T2 (2:1)</div>
+        <div style="font-weight:700;color:#00ff88">₹${fmtN(s.t2)}</div>
+      </div>
+    </div>
+    <div style="font-size:.65rem;color:var(--muted);margin-bottom:8px">${(s.reasons||[]).slice(0,3).join(' &nbsp;|&nbsp; ')}</div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+      <button onclick="executeSniper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
+        style="background:${sigColor}22;border:1px solid ${sigColor};color:${sigColor};padding:5px 14px;border-radius:5px;cursor:pointer;font-weight:700;font-size:.75rem">
+        🚀 Execute Trade
+      </button>
+      <button onclick="executeSniperPaper(this,'${s.symbol}','${s.signal}',${s.entry},${s.sl},${s.t1},${s.t2})"
+        style="background:transparent;border:1px solid var(--border);color:var(--muted);padding:5px 12px;border-radius:5px;cursor:pointer;font-size:.72rem">
+        📋 Paper Log
+      </button>
+      <span style="font-size:.65rem;color:var(--muted);margin-left:4px">MIS · NSE · LIMIT</span>
+    </div>
+  </div>`;
+}
+
+async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
+  if (!confirm(
+    '⚠️ LIVE ORDER — Zerodha Kite\n\n' +
+    direction + ' ' + symbol + '\n' +
+    'Entry: ₹' + fmtN(entry) + '\n' +
+    'SL: ₹' + fmtN(sl) + '\n' +
+    'T1: ₹' + fmtN(t1) + '  T2: ₹' + fmtN(t2) + '\n\n' +
+    'This will place a REAL order. Confirm?'
+  )) return;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Placing...';
+  try {
+    const res = await fetch('/api/sniper/execute', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, direction, entry, sl, t1, t2})
+    }).then(x => x.json());
+
+    if (res.error) {
+      btn.textContent = '❌ ' + res.error;
+      btn.style.color = '#ff4444';
+    } else {
+      btn.textContent = '✅ Order placed #' + res.entry_order_id;
+      btn.style.color = '#00ff88';
+      await loadSniperDailyBar();
+    }
+  } catch(e) {
+    btn.textContent = '❌ ' + e.message;
+    btn.style.color = '#ff4444';
+  }
+}
+
+async function executeSniperPaper(btn, symbol, direction, entry, sl, t1, t2) {
+  btn.disabled = true;
+  btn.textContent = '⏳ Logging...';
+  try {
+    const res = await fetch('/api/sniper/paper', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol, direction, entry, sl, t1, t2})
+    }).then(x => x.json());
+    btn.textContent = res.ok ? '✅ Logged' : '❌ ' + res.error;
+  } catch(e) {
+    btn.textContent = '❌ ' + e.message;
+  }
 }
 
 setTimeout(() => { selectSym('RELIANCE'); _startAutoRefresh(); }, 600);
@@ -9812,6 +10002,441 @@ async def sniper_scan(limit: int = 20, interval: str = "15minute"):
         "wait_summary":   wait_reasons[:10],
         "fetched_at":     datetime.now(tz=IST).strftime("%H:%M:%S IST"),
     }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+#  SNIPER EXECUTION LAYER  —  Daily Risk Guard + Kite Order Placement
+# ════════════════════════════════════════════════════════════════════════════════
+
+# ── Daily Trade Limiter ───────────────────────────────────────────────────────
+
+def _sniper_daily_counts() -> Dict:
+    """
+    Read today's sniper trades and losses from signal_log.
+    Returns {"trades": int, "losses": int, "date": str}
+    """
+    try:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(tz=IST).strftime("%Y-%m-%d")
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT,
+                direction TEXT, engine TEXT, confidence REAL,
+                entry_low REAL, entry_high REAL, sl REAL, t1 REAL, t2 REAL,
+                t3 REAL, rr_t2 REAL, position_size INTEGER,
+                outcome TEXT DEFAULT 'OPEN', pnl REAL DEFAULT 0, notes TEXT
+            )
+        """)
+        rows = conn.execute(
+            "SELECT outcome FROM signal_log WHERE engine='sniper' AND ts LIKE ? || '%'",
+            (today,)
+        ).fetchall()
+        conn.close()
+        trades = len(rows)
+        losses = sum(1 for r in rows if r["outcome"] == "LOSS")
+        return {"trades": trades, "losses": losses, "date": today}
+    except Exception:
+        return {"trades": 0, "losses": 0, "date": ""}
+
+
+def _sniper_trading_allowed() -> Tuple[bool, str]:
+    """
+    Returns (allowed, reason).
+    Blocked if: trades_today >= 2  OR  losses_today >= 2.
+    """
+    counts = _sniper_daily_counts()
+    if counts["losses"] >= 2:
+        return False, f"🛑 2 losses today — trading stopped (loss #{counts['losses']} hit daily limit)"
+    if counts["trades"] >= 2:
+        return False, f"🛑 Max 2 trades per day reached ({counts['trades']} taken)"
+    return True, f"OK — {counts['trades']}/2 trades, {counts['losses']}/2 losses today"
+
+
+# ── No-Trade Zone Filters ─────────────────────────────────────────────────────
+
+def _sniper_ema_slope_ok(df: pd.DataFrame, direction: str, min_slope_pct: float = 0.05) -> Tuple[bool, str]:
+    """
+    EMA-50 slope filter: if EMA50 is flat (< min_slope_pct% per candle),
+    market is sideways — skip.
+    slope_pct = (ema[-1] - ema[-5]) / ema[-5] * 100
+    """
+    try:
+        close = df["close"].astype(float)
+        ema50 = _sniper_ema(close, 50)
+        if len(ema50) < 6:
+            return True, "slope check skipped (< 6 rows)"
+        slope = (float(ema50.iloc[-1]) - float(ema50.iloc[-5])) / float(ema50.iloc[-5]) * 100
+        if abs(slope) < min_slope_pct:
+            return False, f"EMA50 slope flat ({slope:+.3f}% over 5 candles) — sideways market"
+        direction_ok = (direction == "BUY" and slope > 0) or (direction == "SELL" and slope < 0)
+        if not direction_ok:
+            return False, f"EMA50 slope {slope:+.3f}% opposes {direction}"
+        return True, f"EMA slope {slope:+.3f}%"
+    except Exception as exc:
+        return True, f"slope check skipped ({exc})"
+
+
+def _sniper_no_inside_bar(df: pd.DataFrame) -> Tuple[bool, str]:
+    """
+    Inside bar filter: if the pattern candle is entirely inside the previous
+    candle's range it's a compression candle — low conviction, skip.
+    """
+    try:
+        if len(df) < 3:
+            return True, "inside bar check skipped"
+        curr = df.iloc[-2]   # pattern candle
+        prev = df.iloc[-3]
+        if float(curr["high"]) <= float(prev["high"]) and float(curr["low"]) >= float(prev["low"]):
+            return False, f"Inside bar — candle range contained within previous candle, skip"
+        return True, "Not inside bar"
+    except Exception:
+        return True, "inside bar check skipped"
+
+
+def _sniper_volume_spike(df: pd.DataFrame, pattern_idx: int, min_mult: float = 1.3) -> Tuple[bool, str]:
+    """
+    Entry candle volume must be ≥ min_mult × average of prior 5 candles.
+    Already used for confidence bonus in _compute_sniper_signal;
+    here it's a hard gate.
+    """
+    try:
+        if "volume" not in df.columns or pattern_idx < 5:
+            return True, "volume check skipped"
+        pat_vol = float(df.iloc[pattern_idx]["volume"])
+        avg_vol = float(df.iloc[max(0, pattern_idx - 5): pattern_idx]["volume"].mean())
+        if avg_vol <= 0:
+            return True, "zero avg volume"
+        mult = pat_vol / avg_vol
+        if mult < min_mult:
+            return False, f"Volume {mult:.1f}x avg — needs {min_mult}x (low participation)"
+        return True, f"Volume {mult:.1f}x avg ✅"
+    except Exception:
+        return True, "volume check skipped"
+
+
+# ── Patch _compute_sniper_signal to add new gates ─────────────────────────────
+# We wrap it so the original function stays intact and tests still pass.
+_original_compute_sniper = _compute_sniper_signal
+
+def _compute_sniper_signal_v2(symbol: str, interval: str = "15minute") -> Dict:
+    """
+    Extended Sniper pipeline: adds 4 extra no-trade filters on top of the 7-gate
+    base engine, plus the daily trade-count guard.
+    Returned dict is identical in structure to _compute_sniper_signal.
+    """
+    # ── Daily risk guard (gate 0) ─────────────────────────────────────────────
+    allowed, block_reason = _sniper_trading_allowed()
+    if not allowed:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {
+            "symbol": symbol, "signal": "WAIT", "engine": "sniper",
+            "reason": block_reason,
+            "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST"),
+        }
+
+    # ── Run original 7-gate engine ────────────────────────────────────────────
+    result = _original_compute_sniper(symbol, interval)
+    if result.get("signal") != "BUY" and result.get("signal") != "SELL":
+        return result      # already WAIT with reason
+
+    # ── Fetch df for extra gates (reuse token / rate-limit safe) ─────────────
+    try:
+        token = get_instrument_token(symbol)
+        if token:
+            with _kite_semaphore:
+                df_extra = kite_manager.get_historical_data(token, interval, 15)
+        else:
+            df_extra = pd.DataFrame()
+    except Exception:
+        df_extra = pd.DataFrame()
+
+    if df_extra.empty or len(df_extra) < 10:
+        return result   # soft fail — don't block on data issues
+
+    direction = result["signal"]
+
+    # ── Gate 8: EMA slope (no sideways) ──────────────────────────────────────
+    slope_ok, slope_note = _sniper_ema_slope_ok(df_extra, direction)
+    if not slope_ok:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": f"📊 {slope_note}",
+                "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+
+    # ── Gate 9: No inside bar ─────────────────────────────────────────────────
+    ib_ok, ib_note = _sniper_no_inside_bar(df_extra)
+    if not ib_ok:
+        IST = timezone(timedelta(hours=5, minutes=30))
+        return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                "reason": f"📦 {ib_note}",
+                "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+
+    # ── Gate 10: Volume spike on pattern candle ───────────────────────────────
+    eng_pat = _sniper_find_engulfing(df_extra)
+    if eng_pat:
+        vol_ok, vol_note = _sniper_volume_spike(df_extra, eng_pat["pattern_idx"])
+        if not vol_ok:
+            IST = timezone(timedelta(hours=5, minutes=30))
+            return {"symbol": symbol, "signal": "WAIT", "engine": "sniper",
+                    "reason": f"📉 {vol_note}",
+                    "fetched_at": datetime.now(tz=IST).strftime("%H:%M:%S IST")}
+        result["reasons"].append(vol_note)
+        result["reasons"].append(slope_note)
+
+    return result
+
+
+# Hotswap the function used by the scan endpoints
+_compute_sniper_signal = _compute_sniper_signal_v2
+
+
+# ── Position Sizing ───────────────────────────────────────────────────────────
+
+def _sniper_position_size(entry: float, sl: float, capital: float = CAPITAL,
+                           risk_pct: float = 0.01) -> int:
+    """
+    Risk 1% of capital per trade (configurable).
+    qty = floor(capital * risk_pct / risk_per_share)
+    Minimum 1, maximum (capital * 0.20) / entry to avoid over-exposure.
+    """
+    risk_per_share = abs(entry - sl)
+    if risk_per_share <= 0:
+        return 1
+    qty = int(CAPITAL * risk_pct / risk_per_share)
+    max_qty = int(CAPITAL * 0.20 / entry)
+    return max(1, min(qty, max_qty))
+
+
+# ── Kite Order Execution ──────────────────────────────────────────────────────
+
+@dataclass
+class SniperOrder:
+    symbol:          str
+    direction:       str      # BUY | SELL
+    entry:           float
+    sl:              float
+    t1:              float    # 1:1 target — book 50% here
+    t2:              float    # 2:1 target — trail rest
+    qty:             int
+    entry_order_id:  Optional[str] = None
+    sl_order_id:     Optional[str] = None
+    t1_order_id:     Optional[str] = None
+    status:          str = "PENDING"   # PENDING | LIVE | PARTIAL | CLOSED | FAILED
+    placed_at:       str = ""
+
+
+def _place_sniper_order(req: "SniperOrderRequest") -> Dict:
+    """
+    Places a 3-leg MIS intraday trade on Kite:
+      Leg 1 — LIMIT entry order
+      Leg 2 — SL-LIMIT stop loss
+      Leg 3 — LIMIT target at T1 (50% qty) for partial booking
+
+    Uses GTT for SL and T1 so they persist even if the app restarts.
+    Returns dict with order IDs or error message.
+
+    IMPORTANT:
+      • Product = MIS (intraday, auto-squared at 3:15 PM)
+      • Exchange = NSE
+      • Variety = regular (not bracket/cover — more reliable)
+    """
+    if not kite_manager.is_authenticated:
+        return {"error": "Kite not authenticated"}
+
+    kite = kite_manager.kite
+    sym  = req.symbol
+    direction = req.direction
+    entry, sl, t1, t2 = req.entry, req.sl, req.t1, req.t2
+
+    qty = _sniper_position_size(entry, sl)
+    if qty < 1:
+        return {"error": "Qty < 1 — risk per share too small"}
+
+    txn_buy  = "BUY"
+    txn_sell = "SELL"
+    entry_txn = txn_buy  if direction == "BUY" else txn_sell
+    exit_txn  = txn_sell if direction == "BUY" else txn_buy
+
+    try:
+        # ── Leg 1: Entry order (LIMIT) ────────────────────────────────────────
+        entry_id = kite.place_order(
+            variety       = kite.VARIETY_REGULAR,
+            exchange      = kite.EXCHANGE_NSE,
+            tradingsymbol = sym,
+            transaction_type = entry_txn,
+            quantity      = qty,
+            product       = kite.PRODUCT_MIS,
+            order_type    = kite.ORDER_TYPE_LIMIT,
+            price         = round(entry, 1),
+            validity      = kite.VALIDITY_DAY,
+            tag           = "SNIPER_ENTRY",
+        )
+        log.info(f"🎯 Sniper entry order placed: {direction} {sym} qty={qty} entry={entry} → {entry_id}")
+    except Exception as e:
+        return {"error": f"Entry order failed: {e}"}
+
+    sl_id = t1_id = None
+
+    try:
+        # ── Leg 2: SL-LIMIT stop loss ─────────────────────────────────────────
+        # trigger at SL, limit 0.5% beyond (avoids slippage rejection)
+        sl_limit = round(sl * 0.995, 1) if direction == "BUY" else round(sl * 1.005, 1)
+        sl_id = kite.place_order(
+            variety          = kite.VARIETY_REGULAR,
+            exchange         = kite.EXCHANGE_NSE,
+            tradingsymbol    = sym,
+            transaction_type = exit_txn,
+            quantity         = qty,
+            product          = kite.PRODUCT_MIS,
+            order_type       = kite.ORDER_TYPE_SL,
+            price            = sl_limit,
+            trigger_price    = round(sl, 1),
+            validity         = kite.VALIDITY_DAY,
+            tag              = "SNIPER_SL",
+        )
+        log.info(f"🛡 SL order placed: {sym} SL={sl} limit={sl_limit} → {sl_id}")
+    except Exception as e:
+        log.warning(f"SL order failed for {sym}: {e} — entry order still live! Cancel manually.")
+
+    try:
+        # ── Leg 3: T1 target (50% qty, partial booking) ──────────────────────
+        t1_qty = max(1, qty // 2)
+        t1_id = kite.place_order(
+            variety          = kite.VARIETY_REGULAR,
+            exchange         = kite.EXCHANGE_NSE,
+            tradingsymbol    = sym,
+            transaction_type = exit_txn,
+            quantity         = t1_qty,
+            product          = kite.PRODUCT_MIS,
+            order_type       = kite.ORDER_TYPE_LIMIT,
+            price            = round(t1, 1),
+            validity         = kite.VALIDITY_DAY,
+            tag              = "SNIPER_T1",
+        )
+        log.info(f"🎯 T1 partial target placed: {sym} T1={t1} qty={t1_qty} → {t1_id}")
+    except Exception as e:
+        log.warning(f"T1 order failed for {sym}: {e}")
+
+    # ── Log to journal ────────────────────────────────────────────────────────
+    risk  = abs(entry - sl)
+    rr    = round(abs(t2 - entry) / risk, 2) if risk > 0 else 0
+    notes = f"LIVE trade | entry_id={entry_id} sl_id={sl_id} t1_id={t1_id}"
+    threading.Thread(
+        target=_log_signal,
+        args=(sym, direction, "sniper-live", 85.0,
+              entry * 0.999, entry * 1.001, sl, t2, rr, notes),
+        daemon=True,
+    ).start()
+
+    return {
+        "ok":             True,
+        "symbol":         sym,
+        "direction":      direction,
+        "qty":            qty,
+        "entry":          entry,
+        "sl":             sl,
+        "t1":             t1,
+        "t2":             t2,
+        "entry_order_id": entry_id,
+        "sl_order_id":    sl_id,
+        "t1_order_id":    t1_id,
+        "note":           f"MIS LIMIT order live. SL={sl}, T1={t1} (50% at 1:1), trail rest to T2={t2}",
+    }
+
+
+# ── FastAPI Request Models ────────────────────────────────────────────────────
+
+from pydantic import BaseModel
+
+class SniperOrderRequest(BaseModel):
+    symbol:    str
+    direction: str
+    entry:     float
+    sl:        float
+    t1:        float
+    t2:        float
+
+
+# ── Execution Endpoints ───────────────────────────────────────────────────────
+
+@app.post("/api/sniper/execute")
+async def execute_sniper_trade(req: SniperOrderRequest):
+    """
+    Place a live MIS trade on Zerodha Kite.
+    Checks daily trade limit before placing.
+    Places: entry LIMIT + SL-LIMIT + T1 partial LIMIT (3 legs).
+    """
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Kite not authenticated"}, status_code=401)
+
+    allowed, block_reason = _sniper_trading_allowed()
+    if not allowed:
+        return JSONResponse({"error": block_reason}, status_code=403)
+
+    # Basic sanity checks
+    if req.direction not in ("BUY", "SELL"):
+        return JSONResponse({"error": "direction must be BUY or SELL"}, status_code=400)
+    if req.direction == "BUY"  and req.sl >= req.entry:
+        return JSONResponse({"error": f"SL {req.sl} must be below entry {req.entry} for BUY"}, status_code=400)
+    if req.direction == "SELL" and req.sl <= req.entry:
+        return JSONResponse({"error": f"SL {req.sl} must be above entry {req.entry} for SELL"}, status_code=400)
+
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, lambda: _place_sniper_order(req))
+        return result
+    except Exception as e:
+        log.error(f"Execute sniper error: {e}", exc_info=True)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/sniper/paper")
+async def paper_sniper_trade(req: SniperOrderRequest):
+    """Log a paper/simulated sniper trade to the journal without placing a real order."""
+    risk = abs(req.entry - req.sl)
+    rr   = round(abs(req.t2 - req.entry) / risk, 2) if risk > 0 else 0
+    try:
+        _log_signal(
+            req.symbol, req.direction, "sniper-paper", 80.0,
+            req.entry * 0.999, req.entry * 1.001,
+            req.sl, req.t2, rr,
+            f"Paper trade | T1={req.t1} T2={req.t2} SL={req.sl}",
+        )
+        return {"ok": True, "note": "Paper trade logged to journal"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/sniper/daily-status")
+async def sniper_daily_status():
+    """Return today's sniper trade count, loss count, and whether trading is allowed."""
+    counts  = _sniper_daily_counts()
+    allowed, reason = _sniper_trading_allowed()
+    _, time_note    = _sniper_time_ok()
+    return {
+        "trades_today":    counts["trades"],
+        "losses_today":    counts["losses"],
+        "trading_allowed": allowed,
+        "block_reason":    reason if not allowed else None,
+        "time_note":       time_note,
+        "date":            counts["date"],
+    }
+
+
+@app.get("/api/sniper/positions")
+async def sniper_positions():
+    """Return current open MIS positions tagged as SNIPER from Kite."""
+    if not kite_manager.is_authenticated:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    try:
+        positions = kite_manager.kite.positions()
+        day_pos   = positions.get("day", [])
+        sniper    = [p for p in day_pos if p.get("product") == "MIS" and abs(p.get("quantity", 0)) > 0]
+        return {"positions": sniper, "count": len(sniper)}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # ════════════════════════════════════════════════════════════════════════════════

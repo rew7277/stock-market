@@ -8622,11 +8622,11 @@ function renderSniperCard(s) {
 
 async function executeSniper(btn, symbol, direction, entry, sl, t1, t2) {
   if (!confirm(
-    '[LIVE ORDER] Zerodha Kite\n\n' +
-    direction + ' ' + symbol + '\n' +
-    'Entry: ₹' + fmtN(entry) + '\n' +
-    'SL: ₹' + fmtN(sl) + '\n' +
-    'T1: ₹' + fmtN(t1) + '  T2: ₹' + fmtN(t2) + '\n\n' +
+    '[LIVE ORDER] Zerodha Kite\\n\\n' +
+    direction + ' ' + symbol + '\\n' +
+    'Entry: ₹' + fmtN(entry) + '\\n' +
+    'SL: ₹' + fmtN(sl) + '\\n' +
+    'T1: ₹' + fmtN(t1) + '  T2: ₹' + fmtN(t2) + '\\n\\n' +
     'This will place a REAL order. Confirm?'
   )) return;
 

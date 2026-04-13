@@ -3579,18 +3579,22 @@ class SMCEngine:
 
     # IST session windows (hour, minute)
     SESSIONS = [
-        ((9, 15),  (9, 30),  "OPEN_EXPLOSIVE",  False, "⚠️ First 15min -- opening range. No new entries."),
+        ((9, 15),  (9, 30),  "OPEN_EXPLOSIVE",  True,  "📊 ORB window 9:15-9:30 — wait for range then trade breakout."),
         ((9, 30),  (10, 30), "TREND",            True,  "✅ Best momentum window. Follow direction."),
         ((10, 30), (11, 30), "TREND",            True,  "✅ Good trend continuation window."),
-        ((11, 30), (13, 0),  "LUNCH",            False, "⚠️ Lunch chop. Low volume, false breakouts. Skip."),
+        ((11, 30), (13, 0),  "LUNCH",            True,  "⚠️ Lunch chop 11:30-1PM — lower volume. Use tighter SL."),
         ((13, 0),  (14, 0),  "AFTERNOON",        True,  "✅ Post-lunch reversal setups. Watch OBs."),
         ((14, 0),  (15, 0),  "AFTERNOON",        True,  "✅ Best F&O window. Expiry moves here."),
         ((15, 0),  (15, 30), "CLOSE",            False, "⚠️ Institutional squaring. No new entries."),
     ]
 
     def _get_session(self) -> Tuple[str, bool, str]:
-        now = datetime.now()
+        _IST_TZ = timezone(timedelta(hours=5, minutes=30))
+        now = datetime.now(tz=_IST_TZ)  # Always IST regardless of server timezone
         h, m = now.hour, now.minute
+        # Also block weekends
+        if now.weekday() >= 5:  # Saturday=5, Sunday=6
+            return "PRE", False, "⏳ Market closed — weekend."
         for (sh, sm), (eh, em), name, tradeable, note in self.SESSIONS:
             if (h, m) >= (sh, sm) and (h, m) < (eh, em):
                 return name, tradeable, note
@@ -3599,7 +3603,8 @@ class SMCEngine:
     def _calc_vwap(self, df: pd.DataFrame) -> float:
         """True VWAP from today's intraday candles."""
         try:
-            today = pd.Timestamp.now().date()
+            _IST_TZ_V = timezone(timedelta(hours=5, minutes=30))
+            today = datetime.now(tz=_IST_TZ_V).date()  # IST date, not UTC
             mask = pd.to_datetime(df["timestamp"]).dt.date == today
             today_df = df[mask].copy()
             if today_df.empty:
@@ -3956,7 +3961,7 @@ class SMCEngine:
             _t2_def  = round(curr + _atr_est * 2.0, 2)
             _t3_def  = round(curr + _atr_est * 3.0, 2)
             _t4_def  = round(curr + _atr_est * 4.0, 2)
-            return "WAIT", 0.0, (curr - _atr_est*0.2, curr + _atr_est*0.2), _sl_def, _t1_def, _t2_def, _t3_def, _t4_def, notes
+            return "WAIT", 0.0, (round(curr - _atr_est*0.2, 2), round(curr + _atr_est*0.2, 2)), _sl_def, _t1_def, _t2_def, _t3_def, _t4_def, notes
 
         # Find nearest OB to price
         bull_ob_active = next((o for o in obs
@@ -8924,7 +8929,6 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
     elif votes["SELL"] >= 2:
         final_dir = "SELL"
     elif not _session_ok:
-        # Session closed — never tiebreak into a real signal
         _snote = getattr(smc_res, "session_note", "Session not tradeable")
         return {
             "symbol": symbol, "signal": "WAIT", "current_price": current_price,
@@ -8976,7 +8980,7 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
         em   = (entry_low + entry_high) / 2
         _atr_now = float((df["high"] - df["low"]).rolling(14).mean().dropna().iloc[-1]) if len(df) >= 14 else em * 0.005
         risk = abs(em - sl) if sl else em * 0.005
-        risk = max(risk, _atr_now * 0.5)  # minimum risk = 0.5x ATR to prevent flat targets
+        risk = max(risk, _atr_now * 0.5)  # minimum risk = 0.5x ATR
         if final_dir == "BUY":
             t1 = round(em + risk * 1.0,   2)
             t2 = round(em + risk * 1.272, 2)

@@ -8643,28 +8643,39 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
     confidence = 60
     reasons: List[str] = []
 
-    if ict_res and ict_res.ict_direction in ("LONG", "SHORT"):
-        entry_low  = round(ict_res.ict_entry_low,  2)
-        entry_high = round(ict_res.ict_entry_high, 2)
+    if ict_res and ict_res.ict_signal in ("LONG", "SHORT"):
+        entry_low  = round(ict_res.ict_entry_zone[0], 2)
+        entry_high = round(ict_res.ict_entry_zone[1], 2)
         sl         = round(ict_res.ict_sl,  2)
         t1         = round(ict_res.ict_t1,  2)
         t2         = round(ict_res.ict_t2,  2)
         t3         = round(ict_res.ict_t3,  2)
         t4         = round(ict_res.ict_t4,  2)
-        confidence = round(ict_res.ict_confidence * 100)
+        confidence = round(ict_res.ict_confidence)
         if ict_res.daily_bias: reasons.append(f"Daily bias: {ict_res.daily_bias}")
         if ict_res.po3_phase:  reasons.append(f"Po3: {ict_res.po3_phase}")
 
-    # SMC fallback
+    # SMC fallback — SMCAnalysis has no t1/t2/t3, derive from entry zone + risk
     if t1 is None and smc_res:
-        ez = smc_res.smc_entry_zone or [current_price * 0.999, current_price * 1.001]
-        entry_low  = round(min(ez), 2)
-        entry_high = round(max(ez), 2)
-        sl         = round(smc_res.smc_sl, 2)  if smc_res.smc_sl  else None
-        t1         = round(smc_res.smc_t1, 2)  if smc_res.smc_t1  else None
-        t2         = round(smc_res.smc_t2, 2)  if smc_res.smc_t2  else None
-        t3         = round(smc_res.smc_t3, 2)  if smc_res.smc_t3  else None
-        confidence = round(smc_res.smc_confidence)
+        ez = smc_res.smc_entry_zone or (current_price * 0.999, current_price * 1.001)
+        entry_low  = round(float(min(ez)), 2)
+        entry_high = round(float(max(ez)), 2)
+        sl_raw     = smc_res.smc_sl
+        sl         = round(float(sl_raw), 2) if sl_raw else None
+        confidence = round(float(smc_res.smc_confidence))
+        # Derive Fib targets from risk
+        em   = (entry_low + entry_high) / 2
+        risk = abs(em - sl) if sl else em * 0.005
+        if final_dir == "BUY":
+            t1 = round(em + risk * 1.0,   2)
+            t2 = round(em + risk * 1.272, 2)
+            t3 = round(em + risk * 1.618, 2)
+            t4 = round(em + risk * 2.0,   2)
+        else:
+            t1 = round(em - risk * 1.0,   2)
+            t2 = round(em - risk * 1.272, 2)
+            t3 = round(em - risk * 1.618, 2)
+            t4 = round(em - risk * 2.0,   2)
 
     # Pattern boost
     if top_pattern and pat_dir == final_dir:
@@ -8676,6 +8687,7 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
 
     # ── VWAP filter ───────────────────────────────────────────────────────────
     vwap_val = getattr(smc_res, "vwap", None)
+    if vwap_val: vwap_val = float(vwap_val)
     vwap_ok  = True
     if vwap_val:
         if final_dir == "BUY"  and current_price < vwap_val and confidence < 85: vwap_ok = False

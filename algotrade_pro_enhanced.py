@@ -7828,12 +7828,31 @@ async function loadSignal() {
   try {
     const r = await fetch(`/api/signal/${encodeURIComponent(sym)}?interval=${interval}`).then(x => x.json());
     const age = r.data_age_min || 0;
-    const ageStr = age > 60
-      ? `<span style="color:var(--red);font-weight:700">Data ${Math.round(age)} min old — STALE</span>`
-      : r.fetched_at ? `<span style="color:var(--muted)">Data: ${r.fetched_at} (${Math.round(age)} min ago)</span>` : '';
+    // Detect early-market window: before 9:35 IST the last candle is from yesterday —
+    // show an informational note instead of a red STALE warning.
+    const nowIst = new Date(Date.now() + (5.5 * 60 - new Date().getTimezoneOffset()) * 60000);
+    const istH = nowIst.getUTCHours(), istM = nowIst.getUTCMinutes();
+    const isEarlyMarket = (istH === 9 && istM < 35) || istH < 9;
+    let ageStr = '';
+    if (age > 60 && isEarlyMarket) {
+      ageStr = `<span style="color:var(--yellow);font-weight:600">Early session — yesterday's close used</span>`;
+    } else if (age > 60) {
+      ageStr = `<span style="color:var(--red);font-weight:700">Data ${Math.round(age)} min old — STALE</span>`;
+    } else if (r.fetched_at) {
+      ageStr = `<span style="color:var(--muted)">Data: ${r.fetched_at} (${Math.round(age)} min ago)</span>`;
+    }
     document.getElementById('sigAge').innerHTML = ageStr;
     document.getElementById('sigBody').innerHTML = renderSignalCard(r);
-    if (r.signal !== 'WAIT') _startSignalTimer('15minute');
+    // Only start the valid-for timer when we have a real actionable signal.
+    // If r.error is set (stale data, auth failure, etc.) or signal is absent/WAIT,
+    // clear any leftover timer text instead of starting a bogus countdown.
+    if (r.signal && r.signal !== 'WAIT' && !r.error) {
+      _startSignalTimer('15minute');
+    } else {
+      if (_sigTimerInterval) { clearInterval(_sigTimerInterval); _sigTimerInterval = null; }
+      const _tel = document.getElementById('sigTimerEl');
+      if (_tel) _tel.textContent = '';
+    }
   } catch(e) {
     document.getElementById('sigBody').innerHTML = `<p class="red" style="font-size:.78rem">Error: ${e.message}</p>`;
   }
@@ -8990,9 +9009,21 @@ def _guard_freshness(df: pd.DataFrame, symbol: str, max_age: int = 75) -> Option
     Returns a stale error dict if data is too old during market hours.
     Returns None if data is fresh (caller proceeds normally).
     max_age: minutes — default 75 (one 15-min candle + 1 hour buffer)
+
+    Early-market bypass: the first complete 15-min candle closes at 9:30 IST.
+    Before 9:35 AM IST we intentionally skip the stale check because the last
+    available candle is legitimately from yesterday's 15:30 close — this is NOT
+    a stale session, it is normal overnight gap data.
     """
     if not _is_market_hours():
         return None          # outside market hours — age is expected to be large
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(tz=IST)
+    # First complete 15-min candle closes at 9:30; allow 5-min Kite publish delay.
+    # Before 9:35 AM, yesterday's 15:30 candle is the most recent — skip stale check.
+    first_candle_ready = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+    if now_ist < first_candle_ready:
+        return None          # early market open — overnight gap is expected
     age = _data_age_minutes(df)
     if age > max_age:
         return _stale_error(age, symbol)
@@ -9042,8 +9073,15 @@ def _compute_simple_signal(symbol: str, interval: str = "15minute") -> Dict:
     is_market_hours = (now_ist.weekday() < 5 and
                        market_open <= now_ist <= market_close)
 
-    # During market hours, reject data older than 60 min — stale Kite session
-    if is_market_hours and data_age_min > 60:
+    # Early-market bypass: the first complete 15-min candle closes at 9:30 IST.
+    # Before 9:35 AM the most recent Kite candle is legitimately yesterday's 15:30
+    # close — this is a normal overnight gap, NOT a stale/expired session.
+    # Firing a stale error here after a fresh login is a false positive.
+    first_candle_ready = now_ist.replace(hour=9, minute=35, second=0, microsecond=0)
+    is_pre_first_candle = is_market_hours and (now_ist < first_candle_ready)
+
+    # During market hours (after first candle available), reject data > 60 min old
+    if is_market_hours and not is_pre_first_candle and data_age_min > 60:
         return {
             "error": (
                 f"Data is {data_age_min:.0f} min old — Kite session likely expired. "
